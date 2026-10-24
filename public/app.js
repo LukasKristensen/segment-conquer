@@ -94,6 +94,27 @@ async function loadLibrary() {
     store.sources.set(s.summary.id, new Set(s.sources));
   }
   store.efforts = new Map(Object.entries(data.efforts).map(([id, e]) => [Number(id), e]));
+  updateSportFilter();
+}
+
+// One option per sport in the library, most segments first.
+function updateSportFilter() {
+  const counts = new Map();
+  for (const s of store.summaries.values()) {
+    if (s.hazardous || s.private || !s.activity_type) continue;
+    counts.set(s.activity_type, (counts.get(s.activity_type) || 0) + 1);
+  }
+  if (settings.sport !== 'all' && !counts.has(settings.sport)) counts.set(settings.sport, 0);
+  const options = [...counts].sort((a, b) => b[1] - a[1]);
+  $('#sport-filter').innerHTML =
+    '<option value="all">All sports</option>' +
+    options
+      .map(([type, n]) => {
+        const sp = sportOf({ activity_type: type });
+        return `<option value="${esc(type)}">${sp.icon} ${esc(sp.plural)} (${n})</option>`;
+      })
+      .join('');
+  $('#sport-filter').value = settings.sport;
 }
 
 const hasDiscovered = () => [...store.sources.values()].some((src) => src.has('explore') || src.has('route'));
@@ -209,7 +230,8 @@ function leastSquares(xs, ys, ridge = 1e-3) {
 
 function fitModels() {
   models = {};
-  for (const sport of ['Ride', 'Run']) {
+  const sports = new Set([...store.efforts.keys()].map((id) => store.summaries.get(id)?.activity_type).filter(Boolean));
+  for (const sport of sports) {
     const xs = [];
     const ys = [];
     for (const [id, eff] of store.efforts) {
@@ -242,8 +264,8 @@ function predictTime(seg) {
 // Why a segment you haven't done has no predicted time, in words.
 function noPredictionReason(seg) {
   if (!store.efforts.size) return 'Sync first: your speed is learned from the segments in your activities.';
-  const sport = seg?.activity_type === 'Run' ? 'run' : 'ride';
-  return `Not enough of your ${sport} PRs to predict your time (needs ${MIN_PRS}). Scan more activities with ${sport}s in them.`;
+  const { name } = sportOf(seg);
+  return `Not enough of your ${name} PRs to predict your time (needs ${MIN_PRS}). Scan more activities with that sport in them.`;
 }
 
 // Great-circle distance in km.
@@ -331,11 +353,35 @@ function fmtTime(sec) {
 const fmtDist = (m) => (m == null ? '-' : m >= 1000 ? `${(m / 1000).toFixed(2)} km` : `${Math.round(m)} m`);
 const fmtPct = (p) => (p == null ? '-' : `${p > 0 ? '+' : ''}${(p * 100).toFixed(1)}%`);
 const fmtInt = (n) => (n == null ? '-' : n.toLocaleString());
-const isRun = (seg) => seg?.activity_type === 'Run';
 
-function fmtPace(seg, sec) {
+// Strava segments carry their own sport. Each gets its usual metric: speed (km/h) for gliding and
+// wheeled sports, pace (min/km) for running and walking, and min/100 m for swimming.
+const SPORTS = {
+  Ride: { icon: '🚴', name: 'ride', plural: 'Rides', done: 'ridden', unit: 'kmh' },
+  EBikeRide: { icon: '🚲', name: 'e-bike ride', plural: 'E-bike rides', done: 'ridden', unit: 'kmh' },
+  Run: { icon: '🏃', name: 'run', plural: 'Runs', done: 'run', unit: 'perKm' },
+  Walk: { icon: '🚶', name: 'walk', plural: 'Walks', done: 'walked', unit: 'perKm' },
+  Hike: { icon: '🥾', name: 'hike', plural: 'Hikes', done: 'hiked', unit: 'perKm' },
+  Swim: { icon: '🏊', name: 'swim', plural: 'Swims', done: 'swum', unit: 'per100m' },
+  AlpineSki: { icon: '⛷️', name: 'alpine ski run', plural: 'Alpine skiing', done: 'skied', unit: 'kmh' },
+  BackcountrySki: { icon: '🎿', name: 'backcountry ski', plural: 'Backcountry skiing', done: 'skied', unit: 'kmh' },
+  NordicSki: { icon: '🎿', name: 'nordic ski', plural: 'Nordic skiing', done: 'skied', unit: 'kmh' },
+  Snowboard: { icon: '🏂', name: 'snowboard run', plural: 'Snowboarding', done: 'ridden', unit: 'kmh' },
+  IceSkate: { icon: '⛸️', name: 'skate', plural: 'Ice skating', done: 'skated', unit: 'kmh' },
+  InlineSkate: { icon: '🛼', name: 'skate', plural: 'Inline skating', done: 'skated', unit: 'kmh' },
+  Rowing: { icon: '🚣', name: 'row', plural: 'Rowing', done: 'rowed', unit: 'kmh' },
+  Kayaking: { icon: '🛶', name: 'paddle', plural: 'Kayaking', done: 'paddled', unit: 'kmh' },
+};
+const sportOf = (seg) =>
+  SPORTS[seg?.activity_type] || { icon: '📍', name: (seg?.activity_type || 'activity').toLowerCase(), plural: seg?.activity_type || 'Other', done: 'done', unit: 'kmh' };
+
+// Speed or pace needed to cover the segment in `sec` seconds. `compact` drops the space before the unit.
+function fmtPace(seg, sec, compact = false) {
   if (!seg?.distance || !sec) return '-';
-  if (isRun(seg)) return `${fmtTime(sec / (seg.distance / 1000))} /km`;
+  const sp = compact ? '' : ' ';
+  const { unit } = sportOf(seg);
+  if (unit === 'perKm') return `${fmtTime(sec / (seg.distance / 1000))}${sp}/km`;
+  if (unit === 'per100m') return `${fmtTime(sec / (seg.distance / 100))}${sp}/100m`;
   return `${((seg.distance / sec) * 3.6).toFixed(1)} km/h`;
 }
 
@@ -478,13 +524,16 @@ async function loadDetails(needs = needsDetail) {
   }
 }
 
+// Strava's map search only knows riding and running: foot sports search as running, the rest as riding.
 function discoverSport() {
-  if (settings.sport !== 'all') return settings.sport;
+  const onFoot = (type) => sportOf({ activity_type: type }).unit === 'perKm';
+  if (settings.sport !== 'all') return onFoot(settings.sport) ? 'Run' : 'Ride';
   let rides = 0;
   let runs = 0;
   for (const id of store.efforts.keys()) {
-    if (store.summaries.get(id)?.activity_type === 'Run') runs++;
-    else rides++;
+    const type = store.summaries.get(id)?.activity_type;
+    if (type === 'Run') runs++;
+    else if (type === 'Ride') rides++;
   }
   return runs > rides ? 'Run' : 'Ride';
 }
@@ -825,18 +874,18 @@ function rowHtml(r) {
           ? `<span class="${r.predicted ? 'predicted' : ''}">${r.predicted ? '~' : ''}${fmtPct(r.gapPct)}<span class="gap-s">${r.gap > 0 ? '+' : ''}${Math.round(r.gap)}s</span></span>`
           : '-';
   const youCell = r.pr != null ? fmtTime(r.pr) : r.predicted != null ? `<span class="predicted" title="Predicted good-day time">~${fmtTime(r.predicted)}</span>` : '-';
-  const icon = isRun(r.seg) ? '🏃' : '🚴';
+  const sport = sportOf(r.seg);
   const target = r.targetSource === 'free' ? 'any' : `${r.targetSource === 'manual' ? '' : '~'}${fmtTime(r.target)}`;
   return `<tr data-id="${r.id}" class="${r.id === selectedId ? 'selected' : ''}">
     <td><div class="seg-name"><span class="bar" style="background:${st.color}"></span>
-      <div><div class="title">${icon} ${esc(r.seg.name)}</div><div class="sub">${esc(r.seg.city || '')}${r.eff ? ` · ${r.eff.count}× ${isRun(r.seg) ? 'run' : 'ridden'}` : ''}</div></div></div></td>
+      <div><div class="title"><span title="${esc(sport.plural)}">${sport.icon}</span> ${esc(r.seg.name)}</div><div class="sub">${esc(r.seg.city || '')}${r.eff ? ` · ${r.eff.count}× ${sport.done}` : ''}</div></div></div></td>
     ${settings.home ? `<td class="num">${r.homeKm != null ? `${r.homeKm.toFixed(1)} km` : '-'}</td>` : ''}
     <td class="num">${fmtDist(r.seg.distance)}</td>
     <td class="num">${r.seg.average_grade != null ? `${r.seg.average_grade.toFixed(1)}%` : '-'}</td>
     <td class="num">${fmtInt(r.athletes)}</td>
     <td class="num">${fmtTime(r.kom)}</td>
     <td class="num">${r.det ? target : '…'}</td>
-    <td class="num">${r.target ? fmtPace(r.seg, r.target).replace(' /km', '/km') : r.targetSource === 'free' ? 'any' : '-'}</td>
+    <td class="num">${r.target ? fmtPace(r.seg, r.target, true) : r.targetSource === 'free' ? 'any' : '-'}</td>
     <td class="num">${youCell}</td>
     <td class="num">${gapCell}</td>
   </tr>`;
@@ -864,7 +913,7 @@ function renderDetail(id) {
 
   el.innerHTML = `
     <button class="close" title="Close">✕</button>
-    <h3>${isRun(r.seg) ? '🏃' : '🚴'} ${esc(r.seg.name)}</h3>
+    <h3>${sportOf(r.seg).icon} ${esc(r.seg.name)}</h3>
     <div class="sub">${esc([r.seg.city, r.det?.state, r.seg.country].filter(Boolean).join(', '))} · from ${esc(sources)}</div>
     <div class="verdict" style="border-color:${st.color}"><b style="color:${st.color}">${st.label}</b><br>${verdict}</div>
     <dl>
@@ -1039,8 +1088,10 @@ function renderMap(rows) {
   if (!map) return;
   segLayer.clearLayers();
   mapLayers.clear();
-  // Draw selected last so it sits on top.
-  const ordered = [...rows].sort((a, b) => (a.id === selectedId) - (b.id === selectedId));
+  // Later layers sit on top: weakest prospects first, top-10 spots near the end, the selected one last.
+  const MAP_ORDER = { unknown: 0, far: 1, unridden: 2, reach: 3, close: 4, free: 5, top10: 6 };
+  const layerRank = (r) => (r.id === selectedId ? 99 : MAP_ORDER[r.status] ?? 0);
+  const ordered = [...rows].sort((a, b) => layerRank(a) - layerRank(b));
   for (const r of ordered) {
     const color = STATUS[r.status].color;
     const selected = r.id === selectedId;
@@ -1054,7 +1105,9 @@ function renderMap(rows) {
             L.circleMarker(pts[0], { radius: 6, color: '#fff', weight: 2, fillColor: '#22c55e', fillOpacity: 1 }).bindTooltip('Start'),
             L.circleMarker(pts[pts.length - 1], { radius: 6, color: '#fff', weight: 2, fillColor: '#111', fillOpacity: 1 }).bindTooltip('Finish'),
           ])
-        : L.polyline(pts, { color, weight: 4, opacity: 0.85 });
+        : r.status === 'top10'
+          ? L.polyline(pts, { color, weight: 5, opacity: 1 })
+          : L.polyline(pts, { color, weight: 4, opacity: 0.85 });
     } else if (r.seg.start_latlng?.length === 2) {
       layer = selected
         ? L.circleMarker(r.seg.start_latlng, { radius: 10, color: '#fff', weight: 3, fillColor: color, fillOpacity: 1 })
