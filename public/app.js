@@ -41,8 +41,10 @@ const DEFAULTS = {
   compareTo: 'auto',
   sigma: 0.1,
   sort: { key: 'score', dir: 1 },
+  home: null, // [lat, lng], only ever stored in this browser
+  radiusKm: 20, // 0 = any distance
   overrides: {}, // segmentId -> actual 10th-place seconds
-  explored: [], // segment summaries found through "Explore map area"
+  explored: [], // legacy: discovered segments from before the database; migrated on load
   hasSynced: false,
 };
 
@@ -62,46 +64,57 @@ function saveSettings() {
 
 // ---------- data store ----------
 
+// A mirror of the server's database. The server is the source of truth; loadLibrary() refreshes this.
 const store = {
   athlete: null,
-  activitiesSeen: new Set(),
-  summaries: new Map(), // segId -> summary (from efforts / starred / explore)
+  summaries: new Map(), // segId -> summary (oldest first seen first)
   details: new Map(), // segId -> full segment detail
-  efforts: new Map(), // segId -> { best, bestDate, count, bestRank }
-  sources: new Map(), // segId -> Set('ridden' | 'starred' | 'explore')
+  detailFetchedAt: new Map(), // segId -> ms timestamp, to spot outdated KOM data
+  efforts: new Map(), // segId -> { best, count, bestRank } across every stored activity
+  sources: new Map(), // segId -> Set('ridden' | 'starred' | 'explore' | 'route')
 };
 
+// Shows a segment immediately while a discovery is running; the server stores it too.
 function addSummary(seg, source) {
   if (!store.summaries.has(seg.id)) store.summaries.set(seg.id, seg);
   if (!store.sources.has(seg.id)) store.sources.set(seg.id, new Set());
   store.sources.get(seg.id).add(source);
 }
 
-function addActivity(act) {
-  if (store.activitiesSeen.has(act.id)) return;
-  store.activitiesSeen.add(act.id);
-  for (const e of act.efforts) {
-    addSummary(e.segment, 'ridden');
-    const cur = store.efforts.get(e.segment_id) || { best: Infinity, bestDate: null, count: 0, bestRank: null };
-    cur.count++;
-    if (e.elapsed_time < cur.best) {
-      cur.best = e.elapsed_time;
-      cur.bestDate = e.start_date;
-    }
-    if (e.kom_rank && (!cur.bestRank || e.kom_rank < cur.bestRank)) cur.bestRank = e.kom_rank;
-    store.efforts.set(e.segment_id, cur);
+async function loadLibrary() {
+  const { data } = await api('/api/library');
+  store.summaries = new Map();
+  store.details = new Map();
+  store.detailFetchedAt = new Map();
+  store.sources = new Map();
+  for (const s of data.segments) {
+    store.summaries.set(s.summary.id, s.summary);
+    if (s.detail) store.details.set(s.summary.id, s.detail);
+    if (s.detailFetchedAt) store.detailFetchedAt.set(s.summary.id, s.detailFetchedAt);
+    store.sources.set(s.summary.id, new Set(s.sources));
   }
+  store.efforts = new Map(Object.entries(data.efforts).map(([id, e]) => [Number(id), e]));
+}
+
+const hasDiscovered = () => [...store.sources.values()].some((src) => src.has('explore') || src.has('route'));
+
+// Older versions kept discovered segments only in this browser. Hand them to the database once.
+async function migrateBrowserSegments() {
+  if (!settings.explored?.length) return;
+  await api('/api/library/import', { method: 'POST', body: JSON.stringify({ segments: settings.explored, source: 'explore' }) });
+  settings.explored = [];
+  saveSettings();
 }
 
 // ---------- API ----------
 
 class StopSync extends Error {}
 
-async function api(path) {
-  const res = await fetch(path);
+async function api(path, init) {
+  const res = await fetch(path, init && { headers: { 'Content-Type': 'application/json' }, ...init });
   const body = await res.json().catch(() => ({}));
   if (body.rate) showRate(body.rate);
-  if (res.status === 429) throw new StopSync(body.error || 'Strava rate limit reached.');
+  if (res.status === 429) throw Object.assign(new StopSync(body.error || 'Strava rate limit reached.'), { retryAt: body.retryAt });
   if (res.status === 401) {
     showConnect();
     throw new StopSync(body.error || 'Not connected.');
@@ -200,26 +213,47 @@ function fitModels() {
     const xs = [];
     const ys = [];
     for (const [id, eff] of store.efforts) {
-      const det = store.details.get(id);
-      if (!det || det.activity_type !== sport || !(det.distance >= 200)) continue;
-      const pr = Math.min(eff.best, det.athlete_pr?.pr_elapsed_time || Infinity);
+      // The effort's segment summary has distance and grade, so no detail request is needed here.
+      const seg = store.details.get(id) || store.summaries.get(id);
+      if (!seg || seg.activity_type !== sport || !(seg.distance >= 200)) continue;
+      const pr = Math.min(eff.best, seg.athlete_pr?.pr_elapsed_time || Infinity);
       if (!Number.isFinite(pr) || pr <= 0) continue;
-      xs.push(features(det));
-      ys.push(Math.log(det.distance / pr));
+      xs.push(features(seg));
+      ys.push(Math.log(seg.distance / pr));
     }
-    if (xs.length < 10) continue;
-    const beta = leastSquares(xs, ys);
+    if (xs.length < MIN_PRS) continue;
+    // With few PRs, drop the distance term (grade only) so the fit stays stable.
+    const k = xs.length >= 10 ? 4 : 3;
+    const fx = xs.map((x) => x.slice(0, k));
+    const beta = leastSquares(fx, ys);
     if (!beta) continue;
-    const residuals = ys.map((y, i) => y - dot(beta, xs[i])).sort((a, b) => a - b);
-    models[sport] = { beta, goodDay: residuals[Math.floor(residuals.length * 0.75)], n: xs.length };
+    const residuals = ys.map((y, i) => y - dot(beta, fx[i])).sort((a, b) => a - b);
+    models[sport] = { beta, k, goodDay: residuals[Math.floor(residuals.length * 0.75)], n: xs.length };
   }
 }
+const MIN_PRS = 4;
 
 function predictTime(seg) {
   const m = models[seg?.activity_type];
   if (!m || !(seg.distance > 0)) return null;
-  return seg.distance / Math.exp(dot(m.beta, features(seg)) + m.goodDay);
+  return seg.distance / Math.exp(dot(m.beta, features(seg).slice(0, m.k)) + m.goodDay);
 }
+
+// Why a segment you haven't done has no predicted time, in words.
+function noPredictionReason(seg) {
+  if (!store.efforts.size) return 'Sync first: your speed is learned from the segments in your activities.';
+  const sport = seg?.activity_type === 'Run' ? 'run' : 'ride';
+  return `Not enough of your ${sport} PRs to predict your time (needs ${MIN_PRS}). Scan more activities with ${sport}s in them.`;
+}
+
+// Great-circle distance in km.
+function haversineKm([lat1, lng1], [lat2, lng2]) {
+  const rad = Math.PI / 180;
+  const a = Math.sin(((lat2 - lat1) * rad) / 2) ** 2 + Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(((lng2 - lng1) * rad) / 2) ** 2;
+  return 6371 * 2 * Math.asin(Math.sqrt(a));
+}
+
+const homeKmOf = (seg) => (settings.home && seg?.start_latlng?.length === 2 ? haversineKm(settings.home, seg.start_latlng) : null);
 
 function boardFor() {
   if (settings.compareTo !== 'auto') return settings.compareTo;
@@ -265,9 +299,12 @@ function analyze(id) {
     status = gapPct <= 0.05 ? 'close' : gapPct <= 0.15 ? 'reach' : 'far';
   }
 
-  const score = { free: -1, close: gapPct, reach: gapPct, far: gapPct, unridden: 10, top10: 20, unknown: 30 }[status];
+  // Lower is better: top-10 spots you hold come first (#1 before #10, then ones without a known rank),
+  // then free spots, then real gaps.
+  const top10Score = -2 + (eff?.bestRank ?? 15) / 100;
+  const score = { top10: top10Score, free: -1, close: gapPct, reach: gapPct, far: gapPct, unridden: 10, unknown: 30 }[status];
 
-  return { id, seg, det, eff, board, pr, predicted, kom, athletes, field, target, targetSource, status, gap, gapPct, score };
+  return { id, seg, det, eff, board, pr, predicted, homeKm: homeKmOf(seg), kom, athletes, field, target, targetSource, status, gap, gapPct, score };
 }
 
 // ---------- formatting ----------
@@ -312,6 +349,7 @@ function setBusy(on) {
   busy = on;
   $('#sync-btn').disabled = on;
   $('#explore-btn').disabled = on;
+  $('#scan-btn').disabled = on;
   if (!on) $('#progress').style.width = '0';
 }
 
@@ -333,45 +371,89 @@ async function sync() {
     const { data: activities } = await api(`/api/activities?count=${settings.scanCount}`);
     const scannable = activities.filter((a) => !a.manual && !/virtual/i.test(a.sport_type || ''));
 
+    // Each activity is stored by the server; already-stored ones cost nothing.
     let done = 0;
+    let fresh = 0;
     await pool(scannable, 4, async (a) => {
-      const { data } = await api(`/api/activity/${a.id}`);
-      addActivity(data);
+      const { cached } = await api(`/api/activity/${a.id}`);
+      if (!cached) fresh++;
       setProgress(++done, scannable.length);
-      setStatus(`Scanning activities ${done}/${scannable.length}`);
+      setStatus(`Checking activities ${done}/${scannable.length}${fresh ? `, ${fresh} new` : ''}`);
     });
 
     try {
-      const { data: starred } = await api('/api/starred');
-      starred.forEach((s) => addSummary(s, 'starred'));
+      await api('/api/starred');
     } catch (err) {
       if (err instanceof StopSync) throw err;
       console.warn('Starred segments failed', err);
     }
 
-    await loadDetails();
+    await loadLibrary();
     settings.hasSynced = true;
     // Nothing discovered yet means "New to me" would be empty; show what was just synced instead.
-    if (settings.mode === 'discover' && !settings.explored.length) setMode('mine');
+    if (settings.mode === 'discover' && !hasDiscovered()) setMode('mine');
     saveSettings();
     fitMapOnce();
+    await loadDetails();
   } catch (err) {
-    setStatus(err.message, true);
+    await loadLibrary().catch(() => {}); // show whatever was stored before the stop
+    handleLoadError(err, sync);
   } finally {
     setBusy(false);
     render();
   }
 }
 
-// Fetch full details (KOM, athlete count, polyline) for every segment we don't have yet.
-async function loadDetails() {
+// When Strava's budget runs out, wait for the window to reset and pick up where we stopped.
+// Everything already fetched is cached, so re-running the action only costs the remaining requests.
+let resumeTimer = null;
+function handleLoadError(err, resume) {
+  if (!err.retryAt) return setStatus(err.message, true);
+  clearTimeout(resumeTimer);
+  const at = new Date(err.retryAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const left = err.left ? `${err.left} segment${err.left === 1 ? '' : 's'} still to load. ` : '';
+  setStatus(`${err.message} ${left}Continuing automatically at ${at} (keep this tab open).`);
+  resumeTimer = setTimeout(resume, Math.max(0, err.retryAt - Date.now()) + 5000);
+}
+
+// Details cost one request each, so only fetch them for segments the current view can show:
+// "New to me" never shows segments you've ridden, and nothing outside the home radius is shown.
+const needsDetail = (s) => {
+  const km = homeKmOf(s);
+  if (settings.home && settings.radiusKm && km != null && km > settings.radiusKm) return false;
+  return settings.mode !== 'discover' || !store.efforts.has(s.id);
+};
+
+async function loadForView() {
+  if (busy) return;
+  setBusy(true);
+  try {
+    await loadDetails();
+  } catch (err) {
+    handleLoadError(err, loadForView);
+  } finally {
+    setBusy(false);
+    render();
+  }
+}
+
+const DETAIL_MAX_AGE = 30 * 24 * 60 * 60 * 1000; // matches the server's segment TTL
+const isOutdated = (id) => Date.now() - (store.detailFetchedAt.get(id) || 0) > DETAIL_MAX_AGE;
+
+// Fetch full details (KOM, athlete count, polyline) for the segments the current view needs:
+// missing ones first, then ones whose KOM data is over 30 days old. Everything else is skipped.
+async function loadDetails(needs = needsDetail) {
   // Most-ridden first; among the rest, the most recently discovered first (those come from the
   // deepest, least popular map tiles, i.e. the softest leaderboards).
-  const pending = [...store.summaries.values()]
+  const candidates = [...store.summaries.values()]
     .map((s, idx) => ({ s, idx, count: store.efforts.get(s.id)?.count || 0 }))
-    .filter(({ s }) => !store.details.has(s.id) && !s.hazardous && !s.private)
+    .filter(({ s }) => !s.hazardous && !s.private && needs(s))
     .sort((a, b) => b.count - a.count || b.idx - a.idx)
     .map(({ s }) => s);
+  const pending = [
+    ...candidates.filter((s) => !store.details.has(s.id)),
+    ...candidates.filter((s) => store.details.has(s.id) && isOutdated(s.id)),
+  ];
 
   let done = 0;
   let fresh = 0;
@@ -379,17 +461,17 @@ async function loadDetails() {
     await pool(pending, 4, async (s) => {
       const { data, cached } = await api(`/api/segment/${s.id}`);
       store.details.set(s.id, data);
-      if (!cached) fresh++;
+      if (!cached) {
+        fresh++;
+        store.detailFetchedAt.set(s.id, Date.now());
+      }
       setProgress(++done, pending.length);
       setStatus(`Loading segment details ${done}/${pending.length}`);
       scheduleRender();
     });
     setStatus(`${store.details.size} segments analysed${fresh ? ` (${fresh} fetched from Strava)` : ''}.`);
   } catch (err) {
-    if (err instanceof StopSync) {
-      const left = pending.length - done;
-      throw new StopSync(`${err.message} ${left} segment${left === 1 ? '' : 's'} still to load; cached data is kept.`);
-    }
+    err.left = pending.length - done;
     throw err;
   }
 }
@@ -405,12 +487,54 @@ function discoverSport() {
   return runs > rides ? 'Run' : 'Ride';
 }
 
+// Map search can be refused for an API app. Remember that, but try again once a day in case
+// Strava lifts it.
+const DAY_MS = 24 * 60 * 60 * 1000;
+const exploreBlocked = () => Boolean(settings.exploreBlocked) && Date.now() - (settings.exploreBlockedAt || 0) < DAY_MS;
+function setExploreBlocked(blocked) {
+  settings.exploreBlocked = blocked;
+  settings.exploreBlockedAt = blocked ? Date.now() : 0;
+  saveSettings();
+  updateDiscoverButton();
+}
+
 // Strava's explore endpoint returns at most the 10 most popular segments in an area. Popular means
 // crowded leaderboards, so whenever an area comes back full we split it into quarters and search
 // again. The deeper tiles surface the quiet segments, which is where top-10 spots are easy.
+// `wanted(tile)` can skip tiles entirely, e.g. ones outside the home radius.
+async function sweep([s0, w0, n0, e0], type, wanted = () => true) {
+  const queue = [[s0, w0, n0, e0]];
+  const known = new Set(store.summaries.keys());
+  let searches = 0;
+  let fresh = 0;
+  let found = 0;
+  while (queue.length && fresh < settings.discoverBudget) {
+    const tile = queue.shift();
+    if (!wanted(tile)) continue;
+    const [s, w, n, e] = tile;
+    const { data, cached } = await api(`/api/explore?bounds=${tile.join(',')}&activity_type=${type}`);
+    searches++;
+    if (!cached) fresh++;
+    for (const seg of data) {
+      if (!known.has(seg.id)) found++;
+      known.add(seg.id);
+      addSummary(seg, 'explore');
+    }
+    if (data.length >= 10 && n - s > 0.004) {
+      const midLat = (s + n) / 2;
+      const midLng = (w + e) / 2;
+      queue.push([s, w, midLat, midLng], [s, midLng, midLat, e], [midLat, w, n, midLng], [midLat, midLng, n, e]);
+    }
+    setProgress(fresh, settings.discoverBudget);
+    setStatus(`Searched ${searches} area${searches === 1 ? '' : 's'}, ${found} new segment${found === 1 ? '' : 's'}…`);
+    scheduleRender();
+  }
+  return { searches, found, unfinished: queue.length > 0 };
+}
+
 async function exploreArea() {
   if (busy || !map) return;
-  if (settings.exploreBlocked) return discoverRoutes();
+  if (exploreBlocked()) return discoverRoutes();
   const view = map.getBounds();
   if (view.getNorth() - view.getSouth() > 3) {
     setStatus('Zoom in to a city or region first; the map view is too large to sweep.', true);
@@ -419,53 +543,48 @@ async function exploreArea() {
   setBusy(true);
   try {
     const sport = discoverSport();
-    const type = sport === 'Run' ? 'running' : 'riding';
-    const b = map.getBounds();
-    const queue = [[b.getSouth(), b.getWest(), b.getNorth(), b.getEast()]];
-    const known = new Set(store.summaries.keys());
-    let searches = 0;
-    let fresh = 0;
-    let found = 0;
-
-    while (queue.length && fresh < settings.discoverBudget) {
-      const [s, w, n, e] = queue.shift();
-      const { data, cached } = await api(`/api/explore?bounds=${[s, w, n, e].join(',')}&activity_type=${type}`);
-      searches++;
-      if (!cached) fresh++;
-      for (const seg of data) {
-        if (!known.has(seg.id)) found++;
-        known.add(seg.id);
-        addSummary(seg, 'explore');
-        if (!settings.explored.some((x) => x.id === seg.id)) settings.explored.push(seg);
-      }
-      if (data.length >= 10 && n - s > 0.004) {
-        const midLat = (s + n) / 2;
-        const midLng = (w + e) / 2;
-        queue.push([s, w, midLat, midLng], [s, midLng, midLat, e], [midLat, w, n, midLng], [midLat, midLng, n, e]);
-      }
-      setProgress(fresh, settings.discoverBudget);
-      setStatus(`Searched ${searches} area${searches === 1 ? '' : 's'}, ${found} new segment${found === 1 ? '' : 's'}…`);
-      scheduleRender();
-    }
-
+    const { searches, found, unfinished } = await sweep(
+      [view.getSouth(), view.getWest(), view.getNorth(), view.getEast()],
+      sport === 'Run' ? 'running' : 'riding'
+    );
+    setExploreBlocked(false);
+    await loadLibrary();
     setMode('discover');
     saveSettings();
     await loadDetails();
     setStatus(
       `Discovered ${found} new ${sport.toLowerCase()} segment${found === 1 ? '' : 's'} in ${searches} searches.` +
-        (queue.length ? ' Search budget used up; click Discover again to dig deeper.' : '')
+        (unfinished ? ' Search budget used up; click Discover again to dig deeper.' : '')
     );
   } catch (err) {
-    if (err.code === 'explore_unavailable') {
-      settings.exploreBlocked = true;
-      saveSettings();
-      updateDiscoverButton();
-    } else setStatus(err.message, true);
+    if (err.code === 'explore_unavailable') setExploreBlocked(true);
+    else handleLoadError(err, exploreArea);
   } finally {
     setBusy(false);
     render();
   }
-  if (settings.exploreBlocked) discoverRoutes();
+  if (exploreBlocked()) discoverRoutes();
+}
+
+// Reads every saved route (re-reading only edited ones) and returns how many segments were new.
+async function readRoutes() {
+  setStatus('Loading your saved routes…');
+  const { data: routes } = await api('/api/routes');
+  const known = new Set(store.summaries.keys());
+  let done = 0;
+  let found = 0;
+  await pool(routes, 4, async (route) => {
+    const { data } = await api(`/api/route/${route.id}${route.updated_at ? `?updated_at=${encodeURIComponent(route.updated_at)}` : ''}`);
+    for (const seg of data.segments) {
+      if (!known.has(seg.id)) found++;
+      known.add(seg.id);
+      addSummary(seg, 'route');
+    }
+    setProgress(++done, routes.length);
+    setStatus(`Reading routes ${done}/${routes.length}, ${found} new segment${found === 1 ? '' : 's'}…`);
+    scheduleRender();
+  });
+  return { routes: routes.length, found };
 }
 
 // Fallback discovery: every segment along the routes you've saved on Strava.
@@ -473,36 +592,78 @@ async function discoverRoutes() {
   if (busy) return;
   setBusy(true);
   try {
-    setStatus('Loading your saved routes…');
-    const { data: routes } = await api('/api/routes');
-    if (!routes.length) {
+    const { routes, found } = await readRoutes();
+    if (!routes) {
       setStatus('Strava blocks map search for this app, and you have no saved routes. Plan routes through new areas on strava.com/maps, then click Discover again.', true);
       return;
     }
-    const known = new Set(store.summaries.keys());
-    let done = 0;
-    let found = 0;
-    await pool(routes, 4, async (route) => {
-      const { data } = await api(`/api/route/${route.id}`);
-      for (const seg of data.segments) {
-        if (!known.has(seg.id)) found++;
-        known.add(seg.id);
-        addSummary(seg, 'route');
-        if (!settings.explored.some((x) => x.id === seg.id)) settings.explored.push(seg);
-      }
-      setProgress(++done, routes.length);
-      setStatus(`Reading routes ${done}/${routes.length}, ${found} new segment${found === 1 ? '' : 's'}…`);
-      scheduleRender();
-    });
+    await loadLibrary();
     setMode('discover');
     saveSettings();
     await loadDetails();
     setStatus(
-      `Found ${found} new segment${found === 1 ? '' : 's'} on your ${routes.length} saved routes. ` +
+      `Found ${found} new segment${found === 1 ? '' : 's'} on your ${routes} saved routes. ` +
         '(Strava blocks map search for this app, so plan routes through new areas on strava.com/maps to discover more.)'
     );
   } catch (err) {
-    setStatus(err.message, true);
+    handleLoadError(err, discoverRoutes);
+  } finally {
+    setBusy(false);
+    render();
+  }
+}
+
+const inRadius = (seg) => {
+  const km = homeKmOf(seg);
+  return km != null && km <= settings.radiusKm;
+};
+
+// Bounding box of the home circle, and whether a map tile overlaps the circle at all.
+function radiusBounds() {
+  const [lat, lng] = settings.home;
+  const dLat = settings.radiusKm / 111.32;
+  const dLng = settings.radiusKm / (111.32 * Math.cos((lat * Math.PI) / 180));
+  return [lat - dLat, lng - dLng, lat + dLat, lng + dLng];
+}
+function tileTouchesRadius([s, w, n, e]) {
+  const [lat, lng] = settings.home;
+  return haversineKm(settings.home, [clamp(lat, s, n), clamp(lng, w, e)]) <= settings.radiusKm;
+}
+
+// Scan everything reachable inside the home radius: map search over the circle when Strava allows
+// it (retried daily), otherwise your saved routes; then details for every known segment in range.
+async function scanRadius() {
+  if (busy || !settings.home || !settings.radiusKm) return;
+  setBusy(true);
+  try {
+    let source = '';
+    if (!exploreBlocked()) {
+      try {
+        const sport = discoverSport();
+        const { searches, unfinished } = await sweep(radiusBounds(), sport === 'Run' ? 'running' : 'riding', tileTouchesRadius);
+        setExploreBlocked(false);
+        source = `Map search covered the radius in ${searches} searches${unfinished ? ' (budget used up; scan again to dig deeper)' : ''}.`;
+      } catch (err) {
+        if (err.code !== 'explore_unavailable') throw err;
+        setExploreBlocked(true);
+      }
+    }
+    if (!source) {
+      const { routes } = await readRoutes();
+      source = `Strava blocks map search for this app, so only segments you've ridden, starred or that lie on your ${routes} saved routes can be found. Plan routes through unexplored roads on strava.com/maps to find more.`;
+    }
+
+    await loadLibrary();
+    setMode('all');
+    saveSettings();
+    render();
+    await loadDetails(inRadius);
+
+    const inside = [...store.summaries.values()].filter((s) => inRadius(s) && !s.hazardous && !s.private);
+    const ridden = inside.filter((s) => store.efforts.has(s.id)).length;
+    setStatus(`${inside.length} segments within ${settings.radiusKm} km: ${ridden} you've done, ${inside.length - ridden} you haven't. ${source}`);
+  } catch (err) {
+    handleLoadError(err, scanRadius);
   } finally {
     setBusy(false);
     render();
@@ -510,7 +671,7 @@ async function discoverRoutes() {
 }
 
 function updateDiscoverButton() {
-  const blocked = Boolean(settings.exploreBlocked);
+  const blocked = exploreBlocked();
   $('#explore-btn').textContent = blocked ? '🔍 Discover from my routes' : '🔍 Discover in view';
   $('#explore-btn').title = blocked
     ? 'Strava blocks map search for this API app, so this lists the segments along your saved Strava routes'
@@ -544,7 +705,8 @@ function visibleRows() {
   const sportOk = (r) => settings.sport === 'all' || r.seg.activity_type === settings.sport;
   const q = $('#search').value.trim().toLowerCase();
   const searchOk = (r) => !q || `${r.seg.name} ${r.seg.city || ''}`.toLowerCase().includes(q);
-  const base = all.filter((r) => modeOk(r) && sportOk(r) && searchOk(r));
+  const radiusOk = (r) => !settings.home || !settings.radiusKm || (r.homeKm != null && r.homeKm <= settings.radiusKm);
+  const base = all.filter((r) => modeOk(r) && sportOk(r) && searchOk(r) && radiusOk(r));
 
   const counts = {};
   for (const chip of CHIPS) counts[chip.key] = base.filter((r) => !chip.statuses || chip.statuses.includes(r.status)).length;
@@ -555,6 +717,7 @@ function visibleRows() {
   const { key, dir } = settings.sort;
   const val = {
     name: (r) => r.seg.name?.toLowerCase(),
+    home: (r) => r.homeKm,
     distance: (r) => r.seg.distance,
     grade: (r) => r.seg.average_grade,
     athletes: (r) => r.athletes,
@@ -584,6 +747,7 @@ function render() {
     </button>`;
   }).join('');
 
+  $('#home-col').classList.toggle('hidden', !settings.home);
   document.querySelectorAll('.seg-table th').forEach((th) => {
     th.classList.toggle('sorted', th.dataset.sort === settings.sort.key);
     th.classList.toggle('asc', th.dataset.sort === settings.sort.key && settings.sort.dir === 1);
@@ -598,7 +762,7 @@ function render() {
       settings.mode === 'discover' && !counts.all
         ? `<p><b>New to me</b> lists segments you have never done, and none have been discovered here yet.</p>
            ${
-             settings.exploreBlocked
+             exploreBlocked()
                ? `<p>Strava blocks map search for this app, so discovery uses the segments along your saved Strava routes.
                   Plan routes through areas you want to explore on <a href="https://www.strava.com/maps" target="_blank" rel="noopener">strava.com/maps</a>, then:</p>
                   <p><button class="btn primary" data-empty="discover">🔍 Discover from my routes</button></p>`
@@ -634,6 +798,7 @@ function rowHtml(r) {
   return `<tr data-id="${r.id}" class="${r.id === selectedId ? 'selected' : ''}">
     <td><div class="seg-name"><span class="bar" style="background:${st.color}"></span>
       <div><div class="title">${icon} ${esc(r.seg.name)}</div><div class="sub">${esc(r.seg.city || '')}${r.eff ? ` · ${r.eff.count}× ridden` : ''}</div></div></div></td>
+    ${settings.home ? `<td class="num">${r.homeKm != null ? `${r.homeKm.toFixed(1)} km` : '-'}</td>` : ''}
     <td class="num">${fmtDist(r.seg.distance)}</td>
     <td class="num">${r.seg.average_grade != null ? `${r.seg.average_grade.toFixed(1)}%` : '-'}</td>
     <td class="num">${fmtInt(r.athletes)}</td>
@@ -661,7 +826,8 @@ function renderDetail(id) {
         : `Never done it. A good-day effort (~${fmtTime(r.predicted)}) should beat the 10th place by about <b>${Math.round(-r.gap)} s</b>.`;
   else if (r.gap != null && r.gap > 0) verdict = `You need to find <b>${Math.round(r.gap)} s</b> (${fmtPct(r.gapPct)}) on your PR.`;
   else if (r.gap != null) verdict = `Your PR is already ${Math.round(-r.gap)} s faster than the ${r.targetSource === 'manual' ? 'entered' : 'estimated'} 10th place. Check the leaderboard - you may already be in.`;
-  else if (r.status === 'unridden' && r.target) verdict = `Never done it. Average <b>${fmtPace(r.seg, r.target)}</b> to get in.`;
+  else if (r.status === 'unridden' && r.target)
+    verdict = `Never done it. Average <b>${fmtPace(r.seg, r.target)}</b> to get in.<br><span class="hint">${noPredictionReason(r.seg)}</span>`;
 
   el.innerHTML = `
     <button class="close" title="Close">✕</button>
@@ -723,6 +889,62 @@ function initMap() {
     attribution: '&copy; OpenStreetMap contributors',
   }).addTo(map);
   segLayer = L.featureGroup().addTo(map);
+  homeLayer = L.featureGroup().addTo(map);
+}
+
+// ---------- home ----------
+
+let homeLayer = null;
+
+function updateHome() {
+  const home = settings.home;
+  $('#home-btn').textContent = home ? '🏠 Move home' : '🏠 Set home';
+  $('#radius').classList.toggle('hidden', !home);
+  $('#scan-btn').classList.toggle('hidden', !home || !settings.radiusKm);
+  $('#scan-btn').textContent = `📡 Scan ${settings.radiusKm} km`;
+  $('#radius').value = String(settings.radiusKm);
+  if (!homeLayer) return;
+  homeLayer.clearLayers();
+  if (!home) return;
+  L.circleMarker(home, { radius: 7, color: '#fff', weight: 2, fillColor: '#fc4c02', fillOpacity: 1 }).bindTooltip('Home').addTo(homeLayer);
+  if (settings.radiusKm) {
+    L.circle(home, { radius: settings.radiusKm * 1000, color: '#fc4c02', weight: 1.5, dashArray: '6 6', fill: false, interactive: false }).addTo(homeLayer);
+  }
+}
+
+function fitHome() {
+  if (!settings.home) return;
+  const km = settings.radiusKm || 20;
+  map.fitBounds(L.latLng(settings.home).toBounds(km * 2000), { padding: [20, 20] });
+}
+
+function pickHome() {
+  const container = map.getContainer();
+  container.classList.add('picking');
+  setStatus('Click your home on the map (Esc to cancel).');
+  const done = () => {
+    container.classList.remove('picking');
+    map.off('click', onClick);
+    document.removeEventListener('keydown', onKey);
+  };
+  const onClick = (e) => {
+    done();
+    settings.home = [+e.latlng.lat.toFixed(4), +e.latlng.lng.toFixed(4)];
+    if (!settings.radiusKm) settings.radiusKm = 20;
+    saveSettings();
+    updateHome();
+    fitHome();
+    setStatus(`Home set. Showing segments within ${settings.radiusKm} km.`);
+    render();
+    loadForView();
+  };
+  const onKey = (e) => {
+    if (e.key !== 'Escape') return;
+    done();
+    setStatus('');
+  };
+  map.on('click', onClick);
+  document.addEventListener('keydown', onKey);
 }
 
 function decodePolyline(str) {
@@ -806,11 +1028,23 @@ function bindEvents() {
     saveSettings();
   });
 
+  $('#home-btn').addEventListener('click', pickHome);
+  $('#scan-btn').addEventListener('click', scanRadius);
+  $('#radius').addEventListener('change', (e) => {
+    settings.radiusKm = Number(e.target.value);
+    saveSettings();
+    updateHome();
+    if (settings.radiusKm) fitHome();
+    render();
+    loadForView(); // a wider radius may show segments without details yet
+  });
+
   $('#mode').value = settings.mode;
   $('#mode').addEventListener('change', (e) => {
     settings.mode = e.target.value;
     saveSettings();
     render();
+    loadForView();
   });
 
   $('#discover-budget').value = String(settings.discoverBudget);
@@ -854,6 +1088,7 @@ function bindEvents() {
       saveSettings();
       render();
     }
+    if (action === 'mine') loadForView();
   });
 
   $('#status-chips').addEventListener('click', (e) => {
@@ -923,11 +1158,15 @@ async function boot() {
   initMap();
   bindEvents();
   updateDiscoverButton();
-  settings.explored.forEach((s) => addSummary(s, 'explore'));
+  updateHome();
+  // Everything known is in the server's database, so the list appears without any Strava request.
+  // Sync only checks for new activities.
+  await migrateBrowserSegments().catch((err) => console.warn('Migrating discovered segments failed', err));
+  await loadLibrary();
+  fitMapOnce();
   render();
-
-  // Re-running a sync is cheap once the server cache is warm, so restore the last session automatically.
-  if (settings.hasSynced || settings.explored.length) sync();
+  setStatus(`${store.summaries.size} segments in your library. Sync to check for new activities.`);
+  loadForView();
 }
 
 boot().catch((err) => {

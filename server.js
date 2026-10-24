@@ -1,7 +1,7 @@
 // Segment Conquer - local server.
 // Handles Strava OAuth (needs the client secret, so it can't live in the browser),
-// proxies the few Strava API endpoints the app uses, and caches responses on disk
-// so re-syncing doesn't burn through Strava's rate limits.
+// proxies the few Strava API endpoints the app uses, and keeps everything it learns in a local
+// SQLite database (plus a small file cache for list responses) so nothing is fetched twice.
 
 import http from 'node:http';
 import fs from 'node:fs/promises';
@@ -9,6 +9,7 @@ import fsSync from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { openDb, importJsonCache } from './db.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const ENV_FILE = path.join(ROOT, '.env');
@@ -25,21 +26,29 @@ const CACHE_DIR = path.join(DATA_DIR, 'cache');
 const TOKEN_FILE = path.join(DATA_DIR, 'tokens.json');
 fsSync.mkdirSync(CACHE_DIR, { recursive: true });
 
+const db = openDb(path.join(DATA_DIR, 'segment-conquer.db'));
+const imported = importJsonCache(db, CACHE_DIR);
+if (imported) console.log(`Imported ${imported.activities} activities and ${imported.details} segment details from the old cache.`);
+
 const STRAVA_API = 'https://www.strava.com/api/v3';
 const MINUTE = 60_000;
 const DAY = 24 * 60 * MINUTE;
 const TTL = {
   athlete: DAY,
   activityList: 10 * MINUTE,
-  activity: Infinity, // efforts on a finished activity don't change
-  segment: 7 * DAY,
-  starred: 30 * MINUTE,
+  segment: 30 * DAY, // KOM times and athlete counts move slowly; details are the bulk of all requests
+  route: 30 * DAY,
+  starred: 6 * 60 * MINUTE,
+  routeList: 30 * MINUTE,
   explore: 7 * DAY,
 };
 
+// Stop this many requests short of Strava's limits so a sync never ends in a hard 429 lockout.
+const RATE_RESERVE = 2;
+
 const isConfigured = () => Boolean(CLIENT_ID && CLIENT_SECRET);
 const pendingStates = new Set();
-let rate = null; // last seen rate-limit headers
+let rate = null; // last seen rate-limit headers, plus when each window resets
 
 // ---------- tokens ----------
 
@@ -77,29 +86,62 @@ async function getAccessToken() {
 
 // ---------- Strava API + cache ----------
 
-function httpError(status, message, code) {
+function httpError(status, message, code, extra = {}) {
   const err = new Error(message);
   err.status = status;
   err.code = code;
+  Object.assign(err, extra);
   return err;
 }
+
+// Strava's short window resets on the quarter hour (UTC), the daily one at midnight UTC.
+const QUARTER = 15 * MINUTE;
+const shortReset = (now) => Math.floor(now / QUARTER) * QUARTER + QUARTER;
+const dailyReset = (now) => Math.floor(now / DAY) * DAY + DAY;
 
 function recordRate(headers) {
   const parse = (v) => (v ? v.split(',').map(Number) : null);
   const limit = parse(headers.get('x-readratelimit-limit') || headers.get('x-ratelimit-limit'));
   const usage = parse(headers.get('x-readratelimit-usage') || headers.get('x-ratelimit-usage'));
   if (limit && usage) {
-    rate = { short: { used: usage[0], limit: limit[0] }, daily: { used: usage[1], limit: limit[1] }, at: Date.now() };
+    const now = Date.now();
+    rate = {
+      short: { used: usage[0], limit: limit[0], resetAt: shortReset(now) },
+      daily: { used: usage[1], limit: limit[1], resetAt: dailyReset(now) },
+      at: now,
+    };
   }
+}
+
+// Refuse locally when the budget is spent, instead of spending requests on 429s.
+function checkBudget() {
+  if (!rate) return;
+  const now = Date.now();
+  for (const w of [rate.daily, rate.short]) {
+    if (now < w.resetAt && w.used >= w.limit - RATE_RESERVE) {
+      const at = new Date(w.resetAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      throw httpError(429, `Strava request budget used up until ${at}.`, 'rate_limited', { retryAt: w.resetAt });
+    }
+  }
+  // Count the request up front so parallel calls see it before Strava's headers come back.
+  if (now < rate.short.resetAt) rate.short.used++;
+  if (now < rate.daily.resetAt) rate.daily.used++;
 }
 
 async function stravaGet(pathname, params = {}) {
   const url = new URL(STRAVA_API + pathname);
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
 
+  checkBudget();
   const res = await fetch(url, { headers: { Authorization: `Bearer ${await getAccessToken()}` } });
   recordRate(res.headers);
-  if (res.status === 429) throw httpError(429, 'Strava rate limit reached. Wait ~15 minutes and sync again.');
+  if (res.status === 429) {
+    const now = Date.now();
+    const dailyOut = rate && rate.daily.used >= rate.daily.limit;
+    const retryAt = dailyOut ? dailyReset(now) : shortReset(now);
+    if (rate && !dailyOut) rate.short.used = rate.short.limit;
+    throw httpError(429, 'Strava rate limit reached.', 'rate_limited', { retryAt });
+  }
   if (res.status === 401) throw httpError(401, 'Strava rejected the token. Reconnect your account.');
   if (!res.ok) throw httpError(res.status, `Strava ${pathname} failed (${res.status}): ${await res.text()}`);
   return res.json();
@@ -188,7 +230,7 @@ function trimSegment(s) {
 
 // ---------- routes ----------
 
-async function api(route, url) {
+async function api(route, url, req) {
   const force = url.searchParams.get('refresh') === '1';
   let m;
 
@@ -206,33 +248,77 @@ async function api(route, url) {
   }
 
   if (route === '/api/activities') {
+    // Incremental: ask only for activities newer than the newest known one, and for older ones only
+    // while fewer than `count` are known. A routine sync is a single request.
     const count = Math.min(Math.max(Number(url.searchParams.get('count')) || 30, 1), 400);
-    const perPage = Math.min(count, 100);
-    const out = [];
-    let anyFresh = false;
-    for (let page = 1; out.length < count; page++) {
-      const r = await cached(`activities-p${page}-n${perPage}`, TTL.activityList, force, () =>
-        stravaGet('/athlete/activities', { per_page: perPage, page })
-      );
-      anyFresh ||= !r.cached;
-      out.push(...r.data.map((a) => ({ id: a.id, name: a.name, sport_type: a.sport_type || a.type, start_date: a.start_date, distance: a.distance, manual: a.manual })));
-      if (r.data.length < perPage) break;
+    const entry = (a) => ({ id: a.id, name: a.name, sport_type: a.sport_type || a.type, start_date: a.start_date, distance: a.distance, manual: a.manual });
+    const epoch = (iso) => Math.floor(Date.parse(iso) / 1000);
+    let fresh = 0;
+    let stale = false;
+    if (!db.indexBounds().n) db.putIndex(db.listActivities()); // seed from activities stored before the index existed
+    try {
+      const { newest } = db.indexBounds();
+      if (force || Date.now() - Number(db.getMeta('activities_checked_at') || 0) > TTL.activityList) {
+        for (let page = 1; ; page++) {
+          const batch = await stravaGet('/athlete/activities', { per_page: 100, page, ...(newest && { after: epoch(newest) }) });
+          fresh++;
+          db.putIndex(batch.map(entry));
+          if (batch.length < 100 || !newest) break; // without `after`, older pages are the backfill's job
+        }
+        db.putMeta('activities_checked_at', Date.now());
+      }
+      while (db.getMeta('activities_complete') !== '1') {
+        const { n, oldest } = db.indexBounds();
+        if (n >= count || !oldest) break;
+        const batch = await stravaGet('/athlete/activities', { per_page: 100, before: epoch(oldest) });
+        fresh++;
+        db.putIndex(batch.map(entry));
+        if (batch.length < 100) db.putMeta('activities_complete', '1'); // reached your first activity
+      }
+    } catch (err) {
+      // Out of budget: carry on with the activities already known rather than blocking the sync.
+      if (err.status !== 429) throw err;
+      stale = true;
     }
-    return { data: out.slice(0, count), cached: !anyFresh };
+    return { data: db.indexNewest(count), cached: !fresh, stale };
+  }
+
+  // Everything the app has ever seen, in one local request: the list the UI starts from.
+  if (route === '/api/library') return db.library();
+
+  // Segments discovered by older versions were only remembered by the browser; it hands them over once.
+  if (route === '/api/library/import' && req.method === 'POST') {
+    const { segments = [], source = 'explore' } = JSON.parse((await readBody(req)) || '{}');
+    db.addSegments(segments, ['explore', 'route', 'starred'].includes(source) ? source : 'explore');
+    return { imported: segments.length };
   }
 
   if ((m = route.match(/^\/api\/activity\/(\d+)$/))) {
-    return cached(`activity-${m[1]}`, TTL.activity, force, async () =>
-      trimActivity(await stravaGet(`/activities/${m[1]}`, { include_all_efforts: true }))
-    );
+    const id = Number(m[1]);
+    const stored = !force && db.getActivity(id);
+    if (stored) return { data: stored, cached: true };
+    const act = trimActivity(await stravaGet(`/activities/${id}`, { include_all_efforts: true }));
+    db.putActivity(act);
+    return { data: act, cached: false };
   }
 
   if ((m = route.match(/^\/api\/segment\/(\d+)$/))) {
-    return cached(`segment-${m[1]}`, TTL.segment, force, async () => trimSegment(await stravaGet(`/segments/${m[1]}`)));
+    const id = Number(m[1]);
+    const stored = db.getDetail(id);
+    if (stored && !force && Date.now() - stored.fetchedAt < TTL.segment) return { data: stored.data, cached: true };
+    try {
+      const detail = trimSegment(await stravaGet(`/segments/${id}`));
+      db.putDetail(detail);
+      return { data: detail, cached: false };
+    } catch (err) {
+      // An outdated KOM time beats no data when Strava says slow down.
+      if (stored && err.status === 429) return { data: stored.data, cached: true, stale: true };
+      throw err;
+    }
   }
 
   if (route === '/api/starred') {
-    return cached('starred', TTL.starred, force, async () => {
+    const r = await cached('starred', TTL.starred, force, async () => {
       const all = [];
       for (let page = 1; page <= 5; page++) {
         const batch = await stravaGet('/segments/starred', { per_page: 200, page });
@@ -241,28 +327,43 @@ async function api(route, url) {
       }
       return all;
     });
+    db.addSegments(r.data, 'starred');
+    return r;
   }
 
   // Saved routes are the discovery fallback when explore is refused: route details list every
   // segment along the route, including ones you have never ridden.
   if (route === '/api/routes') {
-    return cached('routes', TTL.starred, force, async () => {
+    return cached('routes', TTL.routeList, force, async () => {
       const athleteId = (await readTokens())?.athlete_id || (await stravaGet('/athlete')).id;
       const all = [];
       for (let page = 1; page <= 2; page++) {
         const batch = await stravaGet(`/athletes/${athleteId}/routes`, { per_page: 50, page });
-        all.push(...batch.map((r) => ({ id: r.id_str, name: r.name, distance: r.distance, type: r.type, private: r.private })));
+        all.push(...batch.map((r) => ({ id: r.id_str, name: r.name, distance: r.distance, type: r.type, private: r.private, updated_at: r.updated_at })));
         if (batch.length < 50) break;
       }
       return all;
     });
   }
 
+  // A route is read once and again only when Strava's updated_at says it changed.
   if ((m = route.match(/^\/api\/route\/(\d+)$/))) {
-    return cached(`route-${m[1]}`, TTL.segment, force, async () => {
-      const r = await stravaGet(`/routes/${m[1]}`);
+    const id = m[1];
+    const updatedAt = url.searchParams.get('updated_at');
+    const stored = db.getRoute(id);
+    const unchanged = stored && (!updatedAt || !stored.updatedAt || stored.updatedAt === updatedAt);
+    if (unchanged && !force) {
+      if (updatedAt && !stored.updatedAt) db.putRoute(stored.data, updatedAt);
+      return { data: stored.data, cached: true };
+    }
+    // The file cache predates the database; it is only trusted for routes not stored yet.
+    const r = await cached(`route-${id}`, TTL.route, force || Boolean(stored), async () => {
+      const r = await stravaGet(`/routes/${id}`);
       return { id: r.id_str, name: r.name, segments: (r.segments || []).map(trimSegmentSummary) };
     });
+    db.putRoute(r.data, updatedAt);
+    db.addSegments(r.data.segments, 'route');
+    return r;
   }
 
   if (route === '/api/explore') {
@@ -270,7 +371,7 @@ async function api(route, url) {
     if (bounds.length !== 4 || bounds.some((n) => !Number.isFinite(n))) throw httpError(400, 'bounds must be sw_lat,sw_lng,ne_lat,ne_lng');
     const type = url.searchParams.get('activity_type') === 'running' ? 'running' : 'riding';
     const b = bounds.map((n) => n.toFixed(3)).join(',');
-    return cached(`explore-${type}-${b}`, TTL.explore, force, async () => {
+    const r = await cached(`explore-${type}-${b}`, TTL.explore, force, async () => {
       // Strava refuses this endpoint for some API apps even with a valid token. That is not a
       // logged-out state, so report it as its own error instead of a 401.
       const r = await stravaGet('/segments/explore', { bounds: b, activity_type: type }).catch((err) => {
@@ -286,6 +387,8 @@ async function api(route, url) {
         start_latlng: s.start_latlng,
       }));
     });
+    db.addSegments(r.data, 'explore');
+    return r;
   }
 
   throw httpError(404, 'Unknown API route');
@@ -318,10 +421,9 @@ async function handleAuth(route, url, res) {
     return redirect(res, '/');
   }
 
+  // Disconnecting only forgets the Strava tokens; the segment database stays.
   if (route === '/auth/logout') {
     await fs.rm(TOKEN_FILE, { force: true });
-    await fs.rm(CACHE_DIR, { recursive: true, force: true });
-    await fs.mkdir(CACHE_DIR, { recursive: true });
     return redirect(res, '/');
   }
 
@@ -344,6 +446,15 @@ async function serveStatic(route, res) {
   }
 }
 
+async function readBody(req, limit = 5_000_000) {
+  let body = '';
+  for await (const chunk of req) {
+    body += chunk;
+    if (body.length > limit) throw httpError(413, 'Request body too large');
+  }
+  return body;
+}
+
 function send(res, status, body, type = 'text/plain') {
   res.writeHead(status, { 'Content-Type': `${type}; charset=utf-8` });
   res.end(body);
@@ -359,7 +470,7 @@ const server = http.createServer(async (req, res) => {
   const route = url.pathname;
   try {
     if (route.startsWith('/api/')) {
-      const result = await api(route, url);
+      const result = await api(route, url, req);
       return send(res, 200, JSON.stringify({ ...(result && 'data' in result ? result : { data: result }), rate }), 'application/json');
     }
     if (route.startsWith('/auth/')) return await handleAuth(route, url, res);
@@ -367,7 +478,9 @@ const server = http.createServer(async (req, res) => {
   } catch (err) {
     const status = err.status || 500;
     if (status >= 500) console.error(err);
-    if (route.startsWith('/api/')) return send(res, status, JSON.stringify({ error: err.message, code: err.code, rate }), 'application/json');
+    if (route.startsWith('/api/')) {
+      return send(res, status, JSON.stringify({ error: err.message, code: err.code, retryAt: err.retryAt, rate }), 'application/json');
+    }
     send(res, status, err.message);
   }
 });

@@ -49,7 +49,7 @@
         <span id="rate" class="rate" title="Strava read API usage (15 min / daily)"></span>
         <img id="avatar" alt="" />
         <span id="athlete-name"></span>
-        <a href="/auth/logout" class="logout" title="Disconnect and clear cache">⏏</a>
+        <a href="/auth/logout" class="logout" title="Disconnect from Strava (your segment data is kept)">⏏</a>
       </div>
     </header>
 
@@ -63,6 +63,16 @@
               <option value="mine">My segments</option>
               <option value="all">All segments</option>
             </select>
+            <button id="home-btn" class="btn" title="Click, then click your home on the map">🏠 Set home</button>
+            <select id="radius" title="Only show segments starting this close to home">
+              <option value="0">Any distance</option>
+              <option value="5">Within 5 km</option>
+              <option value="10">Within 10 km</option>
+              <option value="20">Within 20 km</option>
+              <option value="30">Within 30 km</option>
+              <option value="50">Within 50 km</option>
+            </select>
+            <button id="scan-btn" class="btn hidden" title="Find and load every segment the app can reach inside the home radius">📡 Scan radius</button>
             <select id="sport-filter">
               <option value="all">All sports</option>
               <option value="Ride">Rides</option>
@@ -85,6 +95,7 @@
             <thead>
               <tr>
                 <th data-sort="name">Segment</th>
+                <th data-sort="home" class="num hidden" id="home-col" title="Distance from home to the segment start">Home</th>
                 <th data-sort="distance" class="num">Dist</th>
                 <th data-sort="grade" class="num">Grade</th>
                 <th data-sort="athletes" class="num">Athletes</th>

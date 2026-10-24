@@ -17,6 +17,28 @@ time and ranks the segments by how far your PR is from it. Easiest wins first:
 
 Everything is shown in a sortable table and on a map, with segments colored by status.
 
+### Segments near home
+
+Click **🏠 Set home**, then click your home on the map. The list is filtered to segments starting
+within the chosen radius (5 to 50 km, default 20), a **Home** column shows each segment's distance,
+and segment details outside the radius aren't fetched. The home location is stored only in your
+browser.
+
+The filter covers every segment the app knows about: ridden, starred, discovered and on your routes.
+If Strava blocks map search for your app, unknown segments near home won't appear until a route or
+activity passes them.
+
+**📡 Scan** finds and loads everything it can inside the radius:
+
+1. When map search is available, it sweeps the whole circle, not just the map view, and skips map
+   tiles outside it. If Strava refused map search before, it retries at most once a day.
+2. Otherwise it reads your saved routes, re-reading only ones you've edited.
+3. It then loads details for every known segment inside the radius, whichever mode is selected, and
+   switches to **All segments**.
+
+The status line then reports how many segments are in range, how many you've done, and where they
+came from.
+
 ### Discovering new segments
 
 The default view, **New to me**, shows segments you have never done. Pan the map to an area and
@@ -76,14 +98,44 @@ The estimate is rough. For segments you care about, open the segment on Strava, 
 ## Rate limits and caching
 
 Strava allows about 100 read requests per 15 minutes and 1,000 per day. Each scanned activity and
-each new segment costs one request, so the first sync of a busy history may hit the limit. When that
-happens the app stops, keeps everything loaded so far, and continues where it left off the next
-time you sync.
+each segment's details cost one request. To keep that low:
 
-Responses are cached in `data/cache/`:
+- Segment details are only loaded for segments the current view can show. **New to me** skips the
+  segments you've ridden; switching to **My segments** loads them on demand. The speed model doesn't
+  need details at all.
+- The server stops 2 requests short of the limit instead of running into Strava's 429 lockout.
+  The app then waits for the window to reset (the quarter hour, or midnight UTC for the daily limit)
+  and continues automatically while the tab stays open.
 
-- activity details forever
-- segment details for 7 days
-- the activity list for 10 minutes
+## Data storage
 
-Later syncs are close to free. The ⏏ button disconnects your account and clears the cache.
+Everything the app learns is stored in a local SQLite database, `data/segment-conquer.db`, using
+Node's built-in `node:sqlite`:
+
+| Table | Holds |
+| --- | --- |
+| `activities` | every activity fetched, with its segment efforts |
+| `efforts` | one row per segment effort (time, KOM rank, PR rank) |
+| `segments` | every segment ever seen: summary, full details and when they were fetched |
+| `segment_sources` | where each segment came from: `ridden`, `starred`, `explore` or `route` |
+| `activity_index` | every entry of your Strava activity list, including manual ones |
+| `routes` | each saved route's segments, plus Strava's `updated_at` for it |
+
+Nothing already stored is fetched again:
+
+- The segment list loads from the database at startup without a single Strava request.
+- **Sync** asks Strava only for activities newer than the newest one stored: one request, at most
+  every 10 minutes. Older activities are fetched only while fewer than "Scan last *N*" are known.
+  Segments from older activities always stay in the list.
+- Activities are fetched once, ever.
+- Routes are read once and again only when Strava's `updated_at` says you edited them.
+- Segment details are fetched only for segments the current view shows (mode and home radius):
+  missing ones first, then ones over 30 days old. When Strava is out of budget, the stored version is
+  used.
+- The route list and starred segments are cached as files in `data/cache/` for 30 minutes and
+  6 hours.
+- The ⏏ button disconnects your Strava account but keeps the database. Delete `data/` to start over.
+
+On first start, the server imports the older per-file cache (`data/cache/activity-*.json`,
+`segment-*.json`, `route-*.json`) into the database. Segments discovered by older versions, which
+lived only in the browser, are handed over the next time the page loads.
