@@ -11,7 +11,7 @@ const STATUS = {
   close: { label: 'Within 5%', color: '#4ade80', hint: 'Your PR is within 5% of the estimated 10th place.' },
   reach: { label: 'Within 15%', color: '#f59e0b', hint: 'A good day (or a tailwind) could do it.' },
   far: { label: '15%+ off', color: '#ef4444', hint: 'Needs a lot more speed than your current PR.' },
-  unridden: { label: 'Not ridden', color: '#60a5fa', hint: 'You have no effort here yet, and there is not enough data to predict your time.' },
+  unridden: { label: 'Not done yet', color: '#60a5fa', hint: 'You have no effort here yet, and there is not enough data to predict your time.' },
   top10: { label: 'Top 10', color: '#f5c542', hint: 'You are (or were, at upload time) in the top 10.' },
   unknown: { label: 'No data', color: '#6b7280', hint: 'Segment details not loaded yet, or Strava has no KOM time for it.' },
 };
@@ -650,7 +650,7 @@ async function scanRadius() {
     }
     if (!source) {
       const { routes } = await readRoutes();
-      source = `Strava blocks map search for this app, so only segments you've ridden, starred or that lie on your ${routes} saved routes can be found. Plan routes through unexplored roads on strava.com/maps to find more.`;
+      source = `Strava blocks map search for this app, so only segments you've done, starred or that lie on your ${routes} saved routes can be found. Plan routes through unexplored roads on strava.com/maps to find more.`;
     }
 
     await loadLibrary();
@@ -797,7 +797,7 @@ function rowHtml(r) {
   const target = r.targetSource === 'free' ? 'any' : `${r.targetSource === 'manual' ? '' : '~'}${fmtTime(r.target)}`;
   return `<tr data-id="${r.id}" class="${r.id === selectedId ? 'selected' : ''}">
     <td><div class="seg-name"><span class="bar" style="background:${st.color}"></span>
-      <div><div class="title">${icon} ${esc(r.seg.name)}</div><div class="sub">${esc(r.seg.city || '')}${r.eff ? ` · ${r.eff.count}× ridden` : ''}</div></div></div></td>
+      <div><div class="title">${icon} ${esc(r.seg.name)}</div><div class="sub">${esc(r.seg.city || '')}${r.eff ? ` · ${r.eff.count}× ${isRun(r.seg) ? 'run' : 'ridden'}` : ''}</div></div></div></td>
     ${settings.home ? `<td class="num">${r.homeKm != null ? `${r.homeKm.toFixed(1)} km` : '-'}</td>` : ''}
     <td class="num">${fmtDist(r.seg.distance)}</td>
     <td class="num">${r.seg.average_grade != null ? `${r.seg.average_grade.toFixed(1)}%` : '-'}</td>

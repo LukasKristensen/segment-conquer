@@ -12,7 +12,7 @@ time and ranks the segments by how far your PR is from it. Easiest wins first:
 | **Within 5%** | Your PR is within 5% of the estimated 10th-place time. |
 | **Within 15%** | A good day or a tailwind away. |
 | **15%+ off** | Needs a lot more speed. |
-| **Not ridden** | No effort yet. Shows the average speed or pace you'd need. |
+| **Not done yet** | No effort yet. Shows the average speed or pace you'd need. |
 | **Top 10** | Strava gave you a top-10 `kom_rank` on an effort (at upload time). |
 
 Everything is shown in a sortable table and on a map, with segments colored by status.
