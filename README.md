@@ -17,6 +17,26 @@ time and ranks the segments by how far your PR is from it. Easiest wins first:
 
 Everything is shown in a sortable table and on a map, with segments colored by status.
 
+## Screenshots
+
+The screenshots use a fictional demo dataset, not a real athlete's data.
+
+**All segments, easiest wins first.** Top-10 spots and free leaderboards come first, then the
+smallest gaps. The **Target** column is the speed (rides) or pace (runs) needed for 10th place.
+
+![All segments ranked by gap, with the map colored by status](docs/screenshots/overview.png)
+
+**Segment details.** Clicking a segment highlights it on the map with start and finish markers.
+The side panel shows the KOM, the estimated 10th place, your PR and where you can enter the real
+10th-place time.
+
+![A selected segment highlighted on the map with its detail panel](docs/screenshots/segment-detail.png)
+
+**New to me.** Segments you haven't done yet, from your saved routes or starred segments. Your
+time (~) is predicted from your PRs, so even untried segments get a gap.
+
+![Segments not done yet with predicted times and gaps](docs/screenshots/new-to-me.png)
+
 ### Segments near home
 
 Click **🏠 Set home**, then click your home on the map. The list is filtered to segments starting

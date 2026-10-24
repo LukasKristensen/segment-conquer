@@ -64,7 +64,7 @@ select, input[type=search], .btn {
 .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
 .btn:disabled { opacity: .5; cursor: default; }
 
-.layout { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); }
+.layout { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr); }
 .list-pane { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--line); }
 .map-pane { position: relative; min-height: 0; }
 #map { position: absolute; inset: 0; background: #1a1d24; }
@@ -89,18 +89,18 @@ select, input[type=search], .btn {
 .seg-table { width: 100%; border-collapse: collapse; }
 .seg-table th {
   position: sticky; top: 0; background: var(--panel); text-align: left; font-weight: 600; color: var(--muted);
-  font-size: 12px; text-transform: uppercase; letter-spacing: .03em; padding: 8px 10px; cursor: pointer;
+  font-size: 12px; text-transform: uppercase; letter-spacing: .03em; padding: 8px 8px; cursor: pointer;
   border-bottom: 1px solid var(--line); white-space: nowrap; user-select: none;
 }
 .seg-table th.sorted::after { content: " ▾"; }
 .seg-table th.sorted.asc::after { content: " ▴"; }
-.seg-table td { padding: 8px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.seg-table td { padding: 8px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
 .seg-table tr { cursor: pointer; }
 .seg-table tbody tr:hover { background: var(--panel-2); }
 .seg-table tr.selected { background: rgba(252, 76, 2, .22); box-shadow: inset 4px 0 0 var(--accent); }
 .seg-table tr.selected .title { font-weight: 600; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
-.seg-name { display: flex; align-items: center; gap: 8px; max-width: 320px; }
+.seg-name { display: flex; align-items: center; gap: 8px; max-width: 300px; }
 .seg-name .title { overflow: hidden; text-overflow: ellipsis; }
 .seg-name .sub { color: var(--muted); font-size: 12px; }
 .bar { width: 4px; align-self: stretch; border-radius: 2px; flex: none; }
