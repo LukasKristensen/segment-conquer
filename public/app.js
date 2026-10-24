@@ -1,0 +1,935 @@
+// Segment Conquer - frontend.
+// Pulls your activities' segment efforts plus segment details through the local server,
+// estimates the 10th-place time per segment and ranks segments by how close you are.
+
+const $ = (sel) => document.querySelector(sel);
+
+// ---------- statuses ----------
+
+const STATUS = {
+  free: { label: 'Free top 10', color: '#22c55e', hint: 'Fewer than 10 athletes on this leaderboard. Just finish it.' },
+  close: { label: 'Within 5%', color: '#4ade80', hint: 'Your PR is within 5% of the estimated 10th place.' },
+  reach: { label: 'Within 15%', color: '#f59e0b', hint: 'A good day (or a tailwind) could do it.' },
+  far: { label: '15%+ off', color: '#ef4444', hint: 'Needs a lot more speed than your current PR.' },
+  unridden: { label: 'Not ridden', color: '#60a5fa', hint: 'You have no effort here yet, and there is not enough data to predict your time.' },
+  top10: { label: 'Top 10', color: '#f5c542', hint: 'You are (or were, at upload time) in the top 10.' },
+  unknown: { label: 'No data', color: '#6b7280', hint: 'Segment details not loaded yet, or Strava has no KOM time for it.' },
+};
+
+const CHIPS = [
+  { key: 'targets', label: 'Best targets', statuses: ['free', 'close', 'reach'] },
+  { key: 'free', label: STATUS.free.label, statuses: ['free'] },
+  { key: 'close', label: STATUS.close.label, statuses: ['close'] },
+  { key: 'reach', label: STATUS.reach.label, statuses: ['reach'] },
+  { key: 'far', label: STATUS.far.label, statuses: ['far'] },
+  { key: 'unridden', label: STATUS.unridden.label, statuses: ['unridden'] },
+  { key: 'top10', label: STATUS.top10.label, statuses: ['top10'] },
+  { key: 'all', label: 'All', statuses: null },
+];
+
+// Rough share of a segment's athletes on each gender leaderboard (athlete_count is not split by gender).
+const FIELD_SHARE = { kom: 0.8, qom: 0.2, overall: 1 };
+
+// ---------- settings (per-browser convenience only) ----------
+
+const DEFAULTS = {
+  scanCount: 30,
+  mode: 'discover', // 'discover' = segments you haven't done, 'mine' = ones you have, 'all'
+  discoverBudget: 25, // max fresh Strava explore calls per Discover click
+  chip: 'targets',
+  sport: 'all',
+  compareTo: 'auto',
+  sigma: 0.1,
+  sort: { key: 'score', dir: 1 },
+  overrides: {}, // segmentId -> actual 10th-place seconds
+  explored: [], // segment summaries found through "Explore map area"
+  hasSynced: false,
+};
+
+function loadSettings() {
+  try {
+    return { ...DEFAULTS, ...JSON.parse(localStorage.getItem('sc.settings') || '{}') };
+  } catch {
+    return { ...DEFAULTS };
+  }
+}
+const settings = loadSettings();
+function saveSettings() {
+  try {
+    localStorage.setItem('sc.settings', JSON.stringify(settings));
+  } catch {}
+}
+
+// ---------- data store ----------
+
+const store = {
+  athlete: null,
+  activitiesSeen: new Set(),
+  summaries: new Map(), // segId -> summary (from efforts / starred / explore)
+  details: new Map(), // segId -> full segment detail
+  efforts: new Map(), // segId -> { best, bestDate, count, bestRank }
+  sources: new Map(), // segId -> Set('ridden' | 'starred' | 'explore')
+};
+
+function addSummary(seg, source) {
+  if (!store.summaries.has(seg.id)) store.summaries.set(seg.id, seg);
+  if (!store.sources.has(seg.id)) store.sources.set(seg.id, new Set());
+  store.sources.get(seg.id).add(source);
+}
+
+function addActivity(act) {
+  if (store.activitiesSeen.has(act.id)) return;
+  store.activitiesSeen.add(act.id);
+  for (const e of act.efforts) {
+    addSummary(e.segment, 'ridden');
+    const cur = store.efforts.get(e.segment_id) || { best: Infinity, bestDate: null, count: 0, bestRank: null };
+    cur.count++;
+    if (e.elapsed_time < cur.best) {
+      cur.best = e.elapsed_time;
+      cur.bestDate = e.start_date;
+    }
+    if (e.kom_rank && (!cur.bestRank || e.kom_rank < cur.bestRank)) cur.bestRank = e.kom_rank;
+    store.efforts.set(e.segment_id, cur);
+  }
+}
+
+// ---------- API ----------
+
+class StopSync extends Error {}
+
+async function api(path) {
+  const res = await fetch(path);
+  const body = await res.json().catch(() => ({}));
+  if (body.rate) showRate(body.rate);
+  if (res.status === 429) throw new StopSync(body.error || 'Strava rate limit reached.');
+  if (res.status === 401) {
+    showConnect();
+    throw new StopSync(body.error || 'Not connected.');
+  }
+  if (!res.ok) throw Object.assign(new Error(body.error || res.statusText), { code: body.code });
+  return body;
+}
+
+// Runs fn over items with limited concurrency. Rate limits / auth errors stop everything;
+// other errors (e.g. a deleted activity) are logged and skipped.
+async function pool(items, concurrency, fn) {
+  let next = 0;
+  let stop = null;
+  async function worker() {
+    while (next < items.length && !stop) {
+      const idx = next++;
+      try {
+        await fn(items[idx], idx);
+      } catch (err) {
+        if (err instanceof StopSync) stop = err;
+        else console.warn('Skipped item', items[idx], err);
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: concurrency }, worker));
+  if (stop) throw stop;
+}
+
+// ---------- estimation ----------
+
+// Inverse standard normal CDF (Acklam's approximation).
+function invNorm(p) {
+  const a = [-39.69683028665376, 220.9460984245205, -275.9285104469687, 138.357751867269, -30.66479806614716, 2.506628277459239];
+  const b = [-54.47609879822406, 161.5858368580409, -155.6989798598866, 66.80131188771972, -13.28068155288572];
+  const c = [-0.007784894002430293, -0.3223964580411365, -2.400758277161838, -2.549732539343734, 4.374664141464968, 2.938163982698783];
+  const d = [0.007784695709041462, 0.3224671290700398, 2.445134137142996, 3.754408661907416];
+  const lo = 0.02425;
+  if (p < lo) {
+    const q = Math.sqrt(-2 * Math.log(p));
+    return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+  }
+  if (p <= 1 - lo) {
+    const q = p - 0.5;
+    const r = q * q;
+    return ((((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q) / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
+  }
+  return -invNorm(1 - p);
+}
+
+// Times ~ log-normal with spread sigma. With N athletes, rank k sits near quantile (k - 0.5) / N.
+function estimate10th(komSeconds, field, sigma) {
+  const z1 = invNorm(0.5 / field);
+  const z10 = invNorm(9.5 / field);
+  return komSeconds * Math.exp(sigma * (z10 - z1));
+}
+
+// ---------- personal speed model ----------
+// Fits ln(speed) ~ uphill grade + downhill grade + ln(distance) over your PRs, per sport, then shifts
+// it to your "good day" (75th percentile of residuals) so a predicted time is a realistic best effort.
+
+let models = {};
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+const features = (s) => {
+  const g = clamp(s.average_grade ?? 0, -10, 15);
+  return [1, Math.max(g, 0), Math.min(g, 0), Math.log(s.distance)];
+};
+const dot = (a, b) => a.reduce((sum, v, i) => sum + v * b[i], 0);
+
+// Ridge-regularised least squares via Gaussian elimination.
+function leastSquares(xs, ys, ridge = 1e-3) {
+  const k = xs[0].length;
+  const A = Array.from({ length: k }, (_, i) => Array.from({ length: k + 1 }, (_, j) => (i === j && i > 0 ? ridge * xs.length : 0)));
+  xs.forEach((x, r) => {
+    for (let i = 0; i < k; i++) {
+      for (let j = 0; j < k; j++) A[i][j] += x[i] * x[j];
+      A[i][k] += x[i] * ys[r];
+    }
+  });
+  for (let c = 0; c < k; c++) {
+    let p = c;
+    for (let r = c + 1; r < k; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;
+    if (Math.abs(A[p][c]) < 1e-12) return null;
+    [A[c], A[p]] = [A[p], A[c]];
+    for (let r = 0; r < k; r++) {
+      if (r === c) continue;
+      const f = A[r][c] / A[c][c];
+      for (let j = c; j <= k; j++) A[r][j] -= f * A[c][j];
+    }
+  }
+  return A.map((row, i) => row[k] / row[i]);
+}
+
+function fitModels() {
+  models = {};
+  for (const sport of ['Ride', 'Run']) {
+    const xs = [];
+    const ys = [];
+    for (const [id, eff] of store.efforts) {
+      const det = store.details.get(id);
+      if (!det || det.activity_type !== sport || !(det.distance >= 200)) continue;
+      const pr = Math.min(eff.best, det.athlete_pr?.pr_elapsed_time || Infinity);
+      if (!Number.isFinite(pr) || pr <= 0) continue;
+      xs.push(features(det));
+      ys.push(Math.log(det.distance / pr));
+    }
+    if (xs.length < 10) continue;
+    const beta = leastSquares(xs, ys);
+    if (!beta) continue;
+    const residuals = ys.map((y, i) => y - dot(beta, xs[i])).sort((a, b) => a - b);
+    models[sport] = { beta, goodDay: residuals[Math.floor(residuals.length * 0.75)], n: xs.length };
+  }
+}
+
+function predictTime(seg) {
+  const m = models[seg?.activity_type];
+  if (!m || !(seg.distance > 0)) return null;
+  return seg.distance / Math.exp(dot(m.beta, features(seg)) + m.goodDay);
+}
+
+function boardFor() {
+  if (settings.compareTo !== 'auto') return settings.compareTo;
+  return store.athlete?.sex === 'F' ? 'qom' : 'kom';
+}
+
+function analyze(id) {
+  const det = store.details.get(id);
+  const seg = det || store.summaries.get(id);
+  const eff = store.efforts.get(id);
+  const board = boardFor();
+
+  const prs = [eff?.best, det?.athlete_pr?.pr_elapsed_time].filter((t) => Number.isFinite(t) && t > 0);
+  const pr = prs.length ? Math.min(...prs) : null;
+  const predicted = pr == null && det ? predictTime(det) : null;
+  const you = pr ?? predicted;
+  const kom = det ? parseTime(det.xoms?.[board]) ?? parseTime(det.xoms?.overall) : null;
+  const athletes = det?.athlete_count ?? null;
+  const field = athletes != null ? Math.max(1, Math.round(athletes * FIELD_SHARE[board])) : null;
+
+  let target = null;
+  let targetSource = null;
+  if (settings.overrides[id]) {
+    target = settings.overrides[id];
+    targetSource = 'manual';
+  } else if (field != null && field < 10) {
+    targetSource = 'free';
+  } else if (kom && field) {
+    target = estimate10th(kom, field, settings.sigma);
+    targetSource = 'estimate';
+  }
+
+  let status;
+  let gap = null;
+  let gapPct = null;
+  if (eff?.bestRank && eff.bestRank <= 10) status = 'top10';
+  else if (targetSource === 'free') status = pr != null ? 'top10' : 'free';
+  else if (target == null) status = 'unknown';
+  else if (you == null) status = 'unridden';
+  else {
+    gap = you - target;
+    gapPct = gap / target;
+    status = gapPct <= 0.05 ? 'close' : gapPct <= 0.15 ? 'reach' : 'far';
+  }
+
+  const score = { free: -1, close: gapPct, reach: gapPct, far: gapPct, unridden: 10, top10: 20, unknown: 30 }[status];
+
+  return { id, seg, det, eff, board, pr, predicted, kom, athletes, field, target, targetSource, status, gap, gapPct, score };
+}
+
+// ---------- formatting ----------
+
+function parseTime(v) {
+  if (v == null || v === '') return null;
+  if (typeof v === 'number') return v;
+  const s = String(v).trim().toLowerCase();
+  if (/^\d+(\.\d+)?\s*s$/.test(s)) return parseFloat(s);
+  const parts = s.replace(/[^\d:.]/g, '').split(':').filter(Boolean).map(Number);
+  if (!parts.length || parts.some((n) => !Number.isFinite(n))) return null;
+  return parts.reduce((acc, n) => acc * 60 + n, 0);
+}
+
+function fmtTime(sec) {
+  if (sec == null || !Number.isFinite(sec)) return '-';
+  sec = Math.round(sec);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = String(sec % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${s}` : `${m}:${s}`;
+}
+
+const fmtDist = (m) => (m == null ? '-' : m >= 1000 ? `${(m / 1000).toFixed(2)} km` : `${Math.round(m)} m`);
+const fmtPct = (p) => (p == null ? '-' : `${p > 0 ? '+' : ''}${(p * 100).toFixed(1)}%`);
+const fmtInt = (n) => (n == null ? '-' : n.toLocaleString());
+const isRun = (seg) => seg?.activity_type === 'Run';
+
+function fmtPace(seg, sec) {
+  if (!seg?.distance || !sec) return '-';
+  if (isRun(seg)) return `${fmtTime(sec / (seg.distance / 1000))} /km`;
+  return `${((seg.distance / sec) * 3.6).toFixed(1)} km/h`;
+}
+
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
+// ---------- sync ----------
+
+let busy = false;
+
+function setBusy(on) {
+  busy = on;
+  $('#sync-btn').disabled = on;
+  $('#explore-btn').disabled = on;
+  if (!on) $('#progress').style.width = '0';
+}
+
+function setStatus(text, isError = false) {
+  const el = $('#status-text');
+  el.textContent = text;
+  el.classList.toggle('error', isError);
+}
+
+function setProgress(done, total) {
+  $('#progress').style.width = total ? `${Math.round((done / total) * 200)}px` : '0';
+}
+
+async function sync() {
+  if (busy) return;
+  setBusy(true);
+  try {
+    setStatus('Loading activity list…');
+    const { data: activities } = await api(`/api/activities?count=${settings.scanCount}`);
+    const scannable = activities.filter((a) => !a.manual && !/virtual/i.test(a.sport_type || ''));
+
+    let done = 0;
+    await pool(scannable, 4, async (a) => {
+      const { data } = await api(`/api/activity/${a.id}`);
+      addActivity(data);
+      setProgress(++done, scannable.length);
+      setStatus(`Scanning activities ${done}/${scannable.length}`);
+    });
+
+    try {
+      const { data: starred } = await api('/api/starred');
+      starred.forEach((s) => addSummary(s, 'starred'));
+    } catch (err) {
+      if (err instanceof StopSync) throw err;
+      console.warn('Starred segments failed', err);
+    }
+
+    await loadDetails();
+    settings.hasSynced = true;
+    // Nothing discovered yet means "New to me" would be empty; show what was just synced instead.
+    if (settings.mode === 'discover' && !settings.explored.length) setMode('mine');
+    saveSettings();
+    fitMapOnce();
+  } catch (err) {
+    setStatus(err.message, true);
+  } finally {
+    setBusy(false);
+    render();
+  }
+}
+
+// Fetch full details (KOM, athlete count, polyline) for every segment we don't have yet.
+async function loadDetails() {
+  // Most-ridden first; among the rest, the most recently discovered first (those come from the
+  // deepest, least popular map tiles, i.e. the softest leaderboards).
+  const pending = [...store.summaries.values()]
+    .map((s, idx) => ({ s, idx, count: store.efforts.get(s.id)?.count || 0 }))
+    .filter(({ s }) => !store.details.has(s.id) && !s.hazardous && !s.private)
+    .sort((a, b) => b.count - a.count || b.idx - a.idx)
+    .map(({ s }) => s);
+
+  let done = 0;
+  let fresh = 0;
+  try {
+    await pool(pending, 4, async (s) => {
+      const { data, cached } = await api(`/api/segment/${s.id}`);
+      store.details.set(s.id, data);
+      if (!cached) fresh++;
+      setProgress(++done, pending.length);
+      setStatus(`Loading segment details ${done}/${pending.length}`);
+      scheduleRender();
+    });
+    setStatus(`${store.details.size} segments analysed${fresh ? ` (${fresh} fetched from Strava)` : ''}.`);
+  } catch (err) {
+    if (err instanceof StopSync) {
+      const left = pending.length - done;
+      throw new StopSync(`${err.message} ${left} segment${left === 1 ? '' : 's'} still to load; cached data is kept.`);
+    }
+    throw err;
+  }
+}
+
+function discoverSport() {
+  if (settings.sport !== 'all') return settings.sport;
+  let rides = 0;
+  let runs = 0;
+  for (const id of store.efforts.keys()) {
+    if (store.summaries.get(id)?.activity_type === 'Run') runs++;
+    else rides++;
+  }
+  return runs > rides ? 'Run' : 'Ride';
+}
+
+// Strava's explore endpoint returns at most the 10 most popular segments in an area. Popular means
+// crowded leaderboards, so whenever an area comes back full we split it into quarters and search
+// again. The deeper tiles surface the quiet segments, which is where top-10 spots are easy.
+async function exploreArea() {
+  if (busy || !map) return;
+  if (settings.exploreBlocked) return discoverRoutes();
+  const view = map.getBounds();
+  if (view.getNorth() - view.getSouth() > 3) {
+    setStatus('Zoom in to a city or region first; the map view is too large to sweep.', true);
+    return;
+  }
+  setBusy(true);
+  try {
+    const sport = discoverSport();
+    const type = sport === 'Run' ? 'running' : 'riding';
+    const b = map.getBounds();
+    const queue = [[b.getSouth(), b.getWest(), b.getNorth(), b.getEast()]];
+    const known = new Set(store.summaries.keys());
+    let searches = 0;
+    let fresh = 0;
+    let found = 0;
+
+    while (queue.length && fresh < settings.discoverBudget) {
+      const [s, w, n, e] = queue.shift();
+      const { data, cached } = await api(`/api/explore?bounds=${[s, w, n, e].join(',')}&activity_type=${type}`);
+      searches++;
+      if (!cached) fresh++;
+      for (const seg of data) {
+        if (!known.has(seg.id)) found++;
+        known.add(seg.id);
+        addSummary(seg, 'explore');
+        if (!settings.explored.some((x) => x.id === seg.id)) settings.explored.push(seg);
+      }
+      if (data.length >= 10 && n - s > 0.004) {
+        const midLat = (s + n) / 2;
+        const midLng = (w + e) / 2;
+        queue.push([s, w, midLat, midLng], [s, midLng, midLat, e], [midLat, w, n, midLng], [midLat, midLng, n, e]);
+      }
+      setProgress(fresh, settings.discoverBudget);
+      setStatus(`Searched ${searches} area${searches === 1 ? '' : 's'}, ${found} new segment${found === 1 ? '' : 's'}…`);
+      scheduleRender();
+    }
+
+    setMode('discover');
+    saveSettings();
+    await loadDetails();
+    setStatus(
+      `Discovered ${found} new ${sport.toLowerCase()} segment${found === 1 ? '' : 's'} in ${searches} searches.` +
+        (queue.length ? ' Search budget used up; click Discover again to dig deeper.' : '')
+    );
+  } catch (err) {
+    if (err.code === 'explore_unavailable') {
+      settings.exploreBlocked = true;
+      saveSettings();
+      updateDiscoverButton();
+    } else setStatus(err.message, true);
+  } finally {
+    setBusy(false);
+    render();
+  }
+  if (settings.exploreBlocked) discoverRoutes();
+}
+
+// Fallback discovery: every segment along the routes you've saved on Strava.
+async function discoverRoutes() {
+  if (busy) return;
+  setBusy(true);
+  try {
+    setStatus('Loading your saved routes…');
+    const { data: routes } = await api('/api/routes');
+    if (!routes.length) {
+      setStatus('Strava blocks map search for this app, and you have no saved routes. Plan routes through new areas on strava.com/maps, then click Discover again.', true);
+      return;
+    }
+    const known = new Set(store.summaries.keys());
+    let done = 0;
+    let found = 0;
+    await pool(routes, 4, async (route) => {
+      const { data } = await api(`/api/route/${route.id}`);
+      for (const seg of data.segments) {
+        if (!known.has(seg.id)) found++;
+        known.add(seg.id);
+        addSummary(seg, 'route');
+        if (!settings.explored.some((x) => x.id === seg.id)) settings.explored.push(seg);
+      }
+      setProgress(++done, routes.length);
+      setStatus(`Reading routes ${done}/${routes.length}, ${found} new segment${found === 1 ? '' : 's'}…`);
+      scheduleRender();
+    });
+    setMode('discover');
+    saveSettings();
+    await loadDetails();
+    setStatus(
+      `Found ${found} new segment${found === 1 ? '' : 's'} on your ${routes.length} saved routes. ` +
+        '(Strava blocks map search for this app, so plan routes through new areas on strava.com/maps to discover more.)'
+    );
+  } catch (err) {
+    setStatus(err.message, true);
+  } finally {
+    setBusy(false);
+    render();
+  }
+}
+
+function updateDiscoverButton() {
+  const blocked = Boolean(settings.exploreBlocked);
+  $('#explore-btn').textContent = blocked ? '🔍 Discover from my routes' : '🔍 Discover in view';
+  $('#explore-btn').title = blocked
+    ? 'Strava blocks map search for this API app, so this lists the segments along your saved Strava routes'
+    : "Sweep the current map view for segments you haven't done yet";
+  $('#discover-budget').classList.toggle('hidden', blocked);
+}
+
+// ---------- rendering ----------
+
+let renderQueued = false;
+function scheduleRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => {
+    renderQueued = false;
+    render();
+  });
+}
+
+let selectedId = null;
+
+function setMode(mode) {
+  settings.mode = mode;
+  $('#mode').value = mode;
+}
+
+function visibleRows() {
+  fitModels();
+  const all = [...store.summaries.keys()].map(analyze).filter((r) => !r.seg.hazardous && !r.seg.private);
+  const modeOk = (r) => settings.mode === 'all' || (settings.mode === 'mine' ? r.pr != null || r.eff : r.pr == null && !r.eff);
+  const sportOk = (r) => settings.sport === 'all' || r.seg.activity_type === settings.sport;
+  const q = $('#search').value.trim().toLowerCase();
+  const searchOk = (r) => !q || `${r.seg.name} ${r.seg.city || ''}`.toLowerCase().includes(q);
+  const base = all.filter((r) => modeOk(r) && sportOk(r) && searchOk(r));
+
+  const counts = {};
+  for (const chip of CHIPS) counts[chip.key] = base.filter((r) => !chip.statuses || chip.statuses.includes(r.status)).length;
+
+  const chip = CHIPS.find((c) => c.key === settings.chip) || CHIPS[0];
+  const rows = base.filter((r) => !chip.statuses || chip.statuses.includes(r.status));
+
+  const { key, dir } = settings.sort;
+  const val = {
+    name: (r) => r.seg.name?.toLowerCase(),
+    distance: (r) => r.seg.distance,
+    grade: (r) => r.seg.average_grade,
+    athletes: (r) => r.athletes,
+    kom: (r) => r.kom,
+    target: (r) => r.target,
+    pr: (r) => r.pr ?? r.predicted,
+    score: (r) => r.score,
+  }[key];
+  rows.sort((a, b) => {
+    const va = val(a);
+    const vb = val(b);
+    if (va == null && vb == null) return 0;
+    if (va == null) return 1;
+    if (vb == null) return -1;
+    return (va < vb ? -1 : va > vb ? 1 : 0) * dir;
+  });
+  return { rows, counts };
+}
+
+function render() {
+  const { rows, counts } = visibleRows();
+
+  $('#status-chips').innerHTML = CHIPS.map((c) => {
+    const color = c.statuses?.length === 1 ? STATUS[c.statuses[0]].color : null;
+    return `<button class="chip ${settings.chip === c.key ? 'active' : ''}" data-chip="${c.key}">
+      ${color ? `<span class="dot" style="background:${color}"></span>` : ''}${c.label}<span class="count">${counts[c.key]}</span>
+    </button>`;
+  }).join('');
+
+  document.querySelectorAll('.seg-table th').forEach((th) => {
+    th.classList.toggle('sorted', th.dataset.sort === settings.sort.key);
+    th.classList.toggle('asc', th.dataset.sort === settings.sort.key && settings.sort.dir === 1);
+  });
+
+  $('#seg-body').innerHTML = rows.map(rowHtml).join('');
+  const empty = $('#empty');
+  empty.classList.toggle('hidden', rows.length > 0);
+  if (!rows.length) {
+    const ridden = store.efforts.size;
+    empty.innerHTML =
+      settings.mode === 'discover' && !counts.all
+        ? `<p><b>New to me</b> lists segments you have never done, and none have been discovered here yet.</p>
+           ${
+             settings.exploreBlocked
+               ? `<p>Strava blocks map search for this app, so discovery uses the segments along your saved Strava routes.
+                  Plan routes through areas you want to explore on <a href="https://www.strava.com/maps" target="_blank" rel="noopener">strava.com/maps</a>, then:</p>
+                  <p><button class="btn primary" data-empty="discover">🔍 Discover from my routes</button></p>`
+               : `<p>Pan and zoom the map to where you like to ride, then:</p>
+                  <p><button class="btn primary" data-empty="discover">🔍 Discover in this map view</button></p>`
+           }
+           ${ridden ? `<p><button class="btn" data-empty="mine">Show my ${ridden} synced segments</button></p>` : ''}`
+        : counts.all
+          ? `<p>None of these ${counts.all} segments are in <b>${esc(CHIPS.find((c) => c.key === settings.chip)?.label)}</b>.</p>
+             <p><button class="btn" data-empty="all">Show all ${counts.all}</button></p>`
+          : store.summaries.size
+          ? 'No segments match these filters.'
+          : 'Hit <b>Sync</b> to scan your recent activities, then use <b>Discover in view</b> to find new ones.';
+  }
+
+  renderMap(rows);
+  if (selectedId) renderDetail(selectedId);
+}
+
+function rowHtml(r) {
+  const st = STATUS[r.status];
+  const gapCell =
+    r.status === 'free'
+      ? `<span class="badge" style="background:${st.color}">FREE</span>`
+      : r.status === 'top10'
+        ? `<span class="badge" style="background:${st.color}">${r.eff?.bestRank ? `#${r.eff.bestRank}` : 'IN'}</span>`
+        : r.gapPct != null
+          ? `<span class="${r.predicted ? 'predicted' : ''}">${r.predicted ? '~' : ''}${fmtPct(r.gapPct)}<span class="gap-s">${r.gap > 0 ? '+' : ''}${Math.round(r.gap)}s</span></span>`
+          : '-';
+  const youCell = r.pr != null ? fmtTime(r.pr) : r.predicted != null ? `<span class="predicted" title="Predicted good-day time">~${fmtTime(r.predicted)}</span>` : '-';
+  const icon = isRun(r.seg) ? '🏃' : '🚴';
+  const target = r.targetSource === 'free' ? 'any' : `${r.targetSource === 'manual' ? '' : '~'}${fmtTime(r.target)}`;
+  return `<tr data-id="${r.id}" class="${r.id === selectedId ? 'selected' : ''}">
+    <td><div class="seg-name"><span class="bar" style="background:${st.color}"></span>
+      <div><div class="title">${icon} ${esc(r.seg.name)}</div><div class="sub">${esc(r.seg.city || '')}${r.eff ? ` · ${r.eff.count}× ridden` : ''}</div></div></div></td>
+    <td class="num">${fmtDist(r.seg.distance)}</td>
+    <td class="num">${r.seg.average_grade != null ? `${r.seg.average_grade.toFixed(1)}%` : '-'}</td>
+    <td class="num">${fmtInt(r.athletes)}</td>
+    <td class="num">${fmtTime(r.kom)}</td>
+    <td class="num">${r.det ? target : '…'}</td>
+    <td class="num">${youCell}</td>
+    <td class="num">${gapCell}</td>
+  </tr>`;
+}
+
+function renderDetail(id) {
+  const r = analyze(id);
+  const el = $('#detail');
+  if (!r.seg) return el.classList.add('hidden');
+  const st = STATUS[r.status];
+  const boardName = { kom: 'KOM', qom: 'QOM', overall: 'Overall best' }[r.board];
+  const targetLabel = { manual: 'Actual 10th (yours)', estimate: 'Estimated 10th', free: '10th place' }[r.targetSource] || '10th place';
+  const sources = [...(store.sources.get(id) || [])].join(', ');
+
+  let verdict = st.hint;
+  if (r.predicted != null && r.gap != null)
+    verdict =
+      r.gap > 0
+        ? `Never done it. On a good day you'd do about <b>${fmtTime(r.predicted)}</b>, ${Math.round(r.gap)} s (${fmtPct(r.gapPct)}) off the 10th place.`
+        : `Never done it. A good-day effort (~${fmtTime(r.predicted)}) should beat the 10th place by about <b>${Math.round(-r.gap)} s</b>.`;
+  else if (r.gap != null && r.gap > 0) verdict = `You need to find <b>${Math.round(r.gap)} s</b> (${fmtPct(r.gapPct)}) on your PR.`;
+  else if (r.gap != null) verdict = `Your PR is already ${Math.round(-r.gap)} s faster than the ${r.targetSource === 'manual' ? 'entered' : 'estimated'} 10th place. Check the leaderboard - you may already be in.`;
+  else if (r.status === 'unridden' && r.target) verdict = `Never done it. Average <b>${fmtPace(r.seg, r.target)}</b> to get in.`;
+
+  el.innerHTML = `
+    <button class="close" title="Close">✕</button>
+    <h3>${isRun(r.seg) ? '🏃' : '🚴'} ${esc(r.seg.name)}</h3>
+    <div class="sub">${esc([r.seg.city, r.det?.state, r.seg.country].filter(Boolean).join(', '))} · from ${esc(sources)}</div>
+    <div class="verdict" style="border-color:${st.color}"><b style="color:${st.color}">${st.label}</b><br>${verdict}</div>
+    <dl>
+      <dt>Distance</dt><dd>${fmtDist(r.seg.distance)}</dd>
+      <dt>Grade (avg / max)</dt><dd>${r.seg.average_grade?.toFixed(1) ?? '-'}% / ${r.det?.maximum_grade?.toFixed(1) ?? '-'}%</dd>
+      <dt>Elevation gain</dt><dd>${r.det?.total_elevation_gain != null ? `${Math.round(r.det.total_elevation_gain)} m` : '-'}</dd>
+      <dt>Athletes / efforts</dt><dd>${fmtInt(r.athletes)} / ${fmtInt(r.det?.effort_count)}</dd>
+      <dt>Est. ${r.board.toUpperCase()} field</dt><dd>${fmtInt(r.field)}</dd>
+      <dt>${boardName}</dt><dd>${fmtTime(r.kom)} <span class="hint">${fmtPace(r.seg, r.kom)}</span></dd>
+      <dt>${targetLabel}</dt><dd>${r.targetSource === 'free' ? 'any finish' : `${fmtTime(r.target)} <span class="hint">${fmtPace(r.seg, r.target)}</span>`}</dd>
+      ${
+        r.predicted != null
+          ? `<dt>You (predicted)</dt><dd>~${fmtTime(r.predicted)} <span class="hint">${fmtPace(r.seg, r.predicted)}</span></dd>`
+          : `<dt>Your PR</dt><dd>${fmtTime(r.pr)} <span class="hint">${fmtPace(r.seg, r.pr)}</span></dd>`
+      }
+      <dt>Your efforts (scanned)</dt><dd>${r.eff?.count ?? 0}${r.eff?.bestRank ? ` · best rank #${r.eff.bestRank}` : ''}</dd>
+      ${r.det?.local_legend ? `<dt>Local Legend</dt><dd>${esc(r.det.local_legend.title)} <span class="hint">${esc(r.det.local_legend.effort_description || '')}</span></dd>` : ''}
+    </dl>
+    <div class="override">
+      <label for="override-input">Actual 10th place</label>
+      <input id="override-input" placeholder="m:ss" value="${settings.overrides[id] ? fmtTime(settings.overrides[id]) : ''}" />
+      <button class="btn" id="override-save">Save</button>
+      ${settings.overrides[id] ? '<button class="btn" id="override-clear">Clear</button>' : ''}
+    </div>
+    <p class="hint">Open the <a href="https://www.strava.com/segments/${id}" target="_blank" rel="noopener">segment on Strava</a>, read the 10th-place time off the leaderboard and enter it here for an exact gap.</p>
+  `;
+  el.classList.remove('hidden');
+}
+
+function select(id, pan = true) {
+  selectedId = id;
+  render();
+  const layer = mapLayers.get(id);
+  if (pan && layer) map.fitBounds(layer.getBounds ? layer.getBounds() : L.latLngBounds([layer.getLatLng()]), { maxZoom: 15, padding: [40, 40] });
+}
+
+// ---------- map ----------
+
+let map = null;
+let segLayer = null;
+const mapLayers = new Map();
+let mapFitted = false;
+
+function initMap() {
+  const view = settings.mapView;
+  map = L.map('map', { zoomControl: true }).setView(view ? view.center : [30, 0], view ? view.zoom : 2);
+  map.on('moveend', () => {
+    if (!mapFitted && !settings.mapView) return; // ignore the initial world view
+    const c = map.getCenter();
+    settings.mapView = { center: [c.lat, c.lng], zoom: map.getZoom() };
+    saveSettings();
+  });
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap contributors',
+  }).addTo(map);
+  segLayer = L.featureGroup().addTo(map);
+}
+
+function decodePolyline(str) {
+  const pts = [];
+  let i = 0;
+  let lat = 0;
+  let lng = 0;
+  while (i < str.length) {
+    for (const axis of [0, 1]) {
+      let shift = 0;
+      let result = 0;
+      let byte;
+      do {
+        byte = str.charCodeAt(i++) - 63;
+        result |= (byte & 0x1f) << shift;
+        shift += 5;
+      } while (byte >= 0x20);
+      const delta = result & 1 ? ~(result >> 1) : result >> 1;
+      if (axis === 0) lat += delta;
+      else lng += delta;
+    }
+    pts.push([lat / 1e5, lng / 1e5]);
+  }
+  return pts;
+}
+
+function renderMap(rows) {
+  if (!map) return;
+  segLayer.clearLayers();
+  mapLayers.clear();
+  // Draw selected last so it sits on top.
+  const ordered = [...rows].sort((a, b) => (a.id === selectedId) - (b.id === selectedId));
+  for (const r of ordered) {
+    const color = STATUS[r.status].color;
+    const selected = r.id === selectedId;
+    let layer;
+    if (r.det?.polyline) {
+      layer = L.polyline(decodePolyline(r.det.polyline), { color, weight: selected ? 7 : 4, opacity: selected ? 1 : 0.85 });
+    } else if (r.seg.start_latlng?.length === 2) {
+      layer = L.circleMarker(r.seg.start_latlng, { radius: 5, color, fillOpacity: 0.8 });
+    } else continue;
+    layer.bindTooltip(`${esc(r.seg.name)}<br>${STATUS[r.status].label}${r.gapPct != null ? ` · ${fmtPct(r.gapPct)}` : ''}`, { sticky: true });
+    layer.on('click', () => select(r.id, false));
+    layer.addTo(segLayer);
+    mapLayers.set(r.id, layer);
+  }
+}
+
+// Centre the map on where you ride, unless a view was remembered from last time.
+function fitMapOnce() {
+  if (mapFitted || !map || settings.mapView) return;
+  const starts = [...store.efforts.keys()].map((id) => store.summaries.get(id)?.start_latlng).filter((ll) => ll?.length === 2);
+  if (!starts.length) return;
+  mapFitted = true;
+  map.fitBounds(L.latLngBounds(starts), { padding: [30, 30], maxZoom: 13 });
+}
+
+// ---------- header bits ----------
+
+function showRate(rate) {
+  if (!rate?.short) return;
+  $('#rate').textContent = `API ${rate.short.used}/${rate.short.limit} · ${rate.daily.used}/${rate.daily.limit}`;
+}
+
+function showConnect(configured = true) {
+  $('#app').classList.add('hidden');
+  $('#connect').classList.remove('hidden');
+  $('#setup-missing').classList.toggle('hidden', configured);
+  $('#connect-btn').classList.toggle('hidden', !configured);
+}
+
+// ---------- events ----------
+
+function bindEvents() {
+  $('#sync-btn').addEventListener('click', sync);
+  $('#explore-btn').addEventListener('click', exploreArea);
+
+  $('#scan-count').value = String(settings.scanCount);
+  $('#scan-count').addEventListener('change', (e) => {
+    settings.scanCount = Number(e.target.value);
+    saveSettings();
+  });
+
+  $('#mode').value = settings.mode;
+  $('#mode').addEventListener('change', (e) => {
+    settings.mode = e.target.value;
+    saveSettings();
+    render();
+  });
+
+  $('#discover-budget').value = String(settings.discoverBudget);
+  $('#discover-budget').addEventListener('change', (e) => {
+    settings.discoverBudget = Number(e.target.value);
+    saveSettings();
+  });
+
+  $('#sport-filter').value = settings.sport;
+  $('#sport-filter').addEventListener('change', (e) => {
+    settings.sport = e.target.value;
+    saveSettings();
+    render();
+  });
+
+  $('#compare-to').value = settings.compareTo;
+  $('#compare-to').addEventListener('change', (e) => {
+    settings.compareTo = e.target.value;
+    saveSettings();
+    render();
+  });
+
+  const sigma = $('#sigma');
+  sigma.value = settings.sigma;
+  $('#sigma-val').textContent = settings.sigma.toFixed(2);
+  sigma.addEventListener('input', (e) => {
+    settings.sigma = Number(e.target.value);
+    $('#sigma-val').textContent = settings.sigma.toFixed(2);
+    saveSettings();
+    scheduleRender();
+  });
+
+  $('#search').addEventListener('input', scheduleRender);
+
+  $('#empty').addEventListener('click', (e) => {
+    const action = e.target.closest('[data-empty]')?.dataset.empty;
+    if (action === 'discover') exploreArea();
+    if (action === 'mine') setMode('mine');
+    if (action === 'all') settings.chip = 'all';
+    if (action === 'mine' || action === 'all') {
+      saveSettings();
+      render();
+    }
+  });
+
+  $('#status-chips').addEventListener('click', (e) => {
+    const chip = e.target.closest('[data-chip]');
+    if (!chip) return;
+    settings.chip = chip.dataset.chip;
+    saveSettings();
+    render();
+  });
+
+  document.querySelector('.seg-table thead').addEventListener('click', (e) => {
+    const th = e.target.closest('th[data-sort]');
+    if (!th) return;
+    const key = th.dataset.sort;
+    settings.sort = { key, dir: settings.sort.key === key ? -settings.sort.dir : 1 };
+    saveSettings();
+    render();
+  });
+
+  $('#seg-body').addEventListener('click', (e) => {
+    const tr = e.target.closest('tr[data-id]');
+    if (tr) select(Number(tr.dataset.id));
+  });
+
+  $('#detail').addEventListener('click', (e) => {
+    if (e.target.closest('.close')) {
+      selectedId = null;
+      $('#detail').classList.add('hidden');
+      render();
+    } else if (e.target.id === 'override-save') {
+      const secs = parseTime($('#override-input').value);
+      if (secs) settings.overrides[selectedId] = secs;
+      else delete settings.overrides[selectedId];
+      saveSettings();
+      render();
+    } else if (e.target.id === 'override-clear') {
+      delete settings.overrides[selectedId];
+      saveSettings();
+      render();
+    }
+  });
+
+  $('#detail').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && e.target.id === 'override-input') $('#override-save').click();
+  });
+}
+
+// ---------- boot ----------
+
+async function boot() {
+  const { data: status } = await api('/api/status');
+  if (!status.configured) return showConnect(false);
+  if (!status.connected) return showConnect(true);
+
+  try {
+    store.athlete = (await api('/api/me')).data;
+  } catch {
+    return; // api() already switched to the connect screen on 401
+  }
+
+  $('#connect').classList.add('hidden');
+  $('#app').classList.remove('hidden');
+  $('#athlete-name').textContent = `${store.athlete.firstname} ${store.athlete.lastname}`;
+  if (store.athlete.profile?.startsWith('http')) $('#avatar').src = store.athlete.profile;
+  else $('#avatar').classList.add('hidden');
+
+  initMap();
+  bindEvents();
+  updateDiscoverButton();
+  settings.explored.forEach((s) => addSummary(s, 'explore'));
+  render();
+
+  // Re-running a sync is cheap once the server cache is warm, so restore the last session automatically.
+  if (settings.hasSynced || settings.explored.length) sync();
+}
+
+boot().catch((err) => {
+  document.body.innerHTML = `<p style="padding:24px">Failed to start: ${esc(err.message)}. Is the server running?</p>`;
+});

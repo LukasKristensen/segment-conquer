@@ -1,0 +1,12 @@
+{
+  "name": "segment-conquer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Find the Strava segments where you can realistically get into the top 10.",
+  "type": "module",
+  "engines": { "node": ">=21" },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  }
+}

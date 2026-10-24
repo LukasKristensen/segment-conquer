@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Segment Conquer</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏁</text></svg>" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- Connect / setup screen -->
+  <section id="connect" class="connect hidden">
+    <div class="connect-card">
+      <h1>🏁 Segment Conquer</h1>
+      <p class="lead">Find the Strava segments where a top-10 spot is within reach.</p>
+      <div id="setup-missing" class="hidden">
+        <h3>One-time setup</h3>
+        <ol>
+          <li>Create an API app at <a href="https://www.strava.com/settings/api" target="_blank" rel="noopener">strava.com/settings/api</a>.</li>
+          <li>Set <b>Authorization Callback Domain</b> to <code>localhost</code>.</li>
+          <li>Copy <code>.env.example</code> to <code>.env</code> and fill in the Client ID and Client Secret.</li>
+          <li>Restart the server (<code>npm start</code>) and reload this page.</li>
+        </ol>
+      </div>
+      <a id="connect-btn" class="btn-strava hidden" href="/auth/login">Connect with Strava</a>
+    </div>
+  </section>
+
+  <!-- Main app -->
+  <div id="app" class="app hidden">
+    <header class="topbar">
+      <div class="brand">🏁 Segment Conquer</div>
+      <div class="sync">
+        <label>Scan last
+          <select id="scan-count">
+            <option>15</option><option selected>30</option><option>60</option><option>100</option><option>200</option>
+          </select>
+          activities
+        </label>
+        <button id="sync-btn" class="btn primary">Sync</button>
+        <button id="explore-btn" class="btn discover" title="Sweep the current map view for segments you haven't done yet">🔍 Discover in view</button>
+        <select id="discover-budget" title="Max Strava searches per Discover click (each search costs one API request)">
+          <option value="10">10 searches</option><option value="25">25 searches</option><option value="50">50 searches</option>
+        </select>
+      </div>
+      <div class="progress-wrap"><div id="progress" class="progress"></div><span id="status-text" class="status-text"></span></div>
+      <div class="me">
+        <span id="rate" class="rate" title="Strava read API usage (15 min / daily)"></span>
+        <img id="avatar" alt="" />
+        <span id="athlete-name"></span>
+        <a href="/auth/logout" class="logout" title="Disconnect and clear cache">⏏</a>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="list-pane">
+        <div class="filters">
+          <div class="chips" id="status-chips"></div>
+          <div class="filter-row">
+            <select id="mode" title="Which segments to show">
+              <option value="discover">🔍 New to me</option>
+              <option value="mine">My segments</option>
+              <option value="all">All segments</option>
+            </select>
+            <select id="sport-filter">
+              <option value="all">All sports</option>
+              <option value="Ride">Rides</option>
+              <option value="Run">Runs</option>
+            </select>
+            <select id="compare-to" title="Which leaderboard to target">
+              <option value="auto">Leaderboard: auto</option>
+              <option value="kom">KOM (men)</option>
+              <option value="qom">QOM (women)</option>
+              <option value="overall">Overall</option>
+            </select>
+            <label class="slider" title="How spread out leaderboards are. Higher = 10th place is assumed further behind the KOM.">
+              Spread <input id="sigma" type="range" min="0.04" max="0.25" step="0.01" /> <span id="sigma-val"></span>
+            </label>
+            <input id="search" type="search" placeholder="Search segments…" />
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="seg-table">
+            <thead>
+              <tr>
+                <th data-sort="name">Segment</th>
+                <th data-sort="distance" class="num">Dist</th>
+                <th data-sort="grade" class="num">Grade</th>
+                <th data-sort="athletes" class="num">Athletes</th>
+                <th data-sort="kom" class="num">KOM</th>
+                <th data-sort="target" class="num">~10th</th>
+                <th data-sort="pr" class="num" title="Your PR, or ~predicted good-day time on segments you haven't done">You</th>
+                <th data-sort="score" class="num">Gap</th>
+              </tr>
+            </thead>
+            <tbody id="seg-body"></tbody>
+          </table>
+          <div id="empty" class="empty">Hit <b>Sync</b> to scan your recent activities.</div>
+        </div>
+      </section>
+
+      <section class="map-pane">
+        <div id="map"></div>
+        <aside id="detail" class="detail hidden"></aside>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <details>
+        <summary>How is the 10th-place time estimated?</summary>
+        <p>
+          Strava no longer lets apps read segment leaderboards, so the 10th-place time is estimated from what the API does expose:
+          the KOM/QOM time and how many athletes have done the segment. Finish times are modelled as log-normally distributed
+          with the chosen <b>spread</b>; the expected gap between 1st and 10th out of <i>N</i> athletes then follows from the
+          normal quantiles. Gender leaderboards assume ~80% of athletes are men and ~20% women.
+        </p>
+        <p>
+          If fewer than 10 athletes (of your leaderboard) have done a segment, any finish gets you in: those are marked <b>Free</b>.
+          If Strava gave you a <code>kom_rank</code> on one of your efforts, you were top 10 at upload time: marked <b>Top 10</b>.
+          On segments you haven't done, your time is <b>predicted</b> (shown with ~): a model of your speed against grade and
+          distance is fitted to your PRs (needs at least 10 of them per sport), set to a good day (your 75th-percentile effort).
+          <b>Discover in view</b> searches the map view and splits every area that returns Strava's maximum of 10 results
+          into quarters, so it digs past the popular segments to the quiet ones with soft leaderboards.
+        </p>
+        <p>
+          The estimate is rough. Check the real leaderboard on Strava and enter the actual 10th-place time in the side panel for an exact gap.
+        </p>
+      </details>
+    </footer>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
