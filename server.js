@@ -442,7 +442,8 @@ async function serveStatic(route, res) {
   if (!file.startsWith(PUBLIC_DIR)) return send(res, 403, 'Forbidden');
   try {
     const body = await fs.readFile(file);
-    res.writeHead(200, { 'Content-Type': (MIME[path.extname(file)] || 'application/octet-stream') + '; charset=utf-8' });
+    // no-cache: the browser revalidates every load, so a plain reload always picks up app changes.
+    res.writeHead(200, { 'Content-Type': (MIME[path.extname(file)] || 'application/octet-stream') + '; charset=utf-8', 'Cache-Control': 'no-cache' });
     res.end(body);
   } catch {
     send(res, 404, 'Not found');
