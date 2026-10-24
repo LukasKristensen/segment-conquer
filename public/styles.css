@@ -97,7 +97,8 @@ select, input[type=search], .btn {
 .seg-table td { padding: 8px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
 .seg-table tr { cursor: pointer; }
 .seg-table tbody tr:hover { background: var(--panel-2); }
-.seg-table tr.selected { background: rgba(252, 76, 2, .12); }
+.seg-table tr.selected { background: rgba(252, 76, 2, .22); box-shadow: inset 4px 0 0 var(--accent); }
+.seg-table tr.selected .title { font-weight: 600; }
 .num { text-align: right; font-variant-numeric: tabular-nums; }
 .seg-name { display: flex; align-items: center; gap: 8px; max-width: 320px; }
 .seg-name .title { overflow: hidden; text-overflow: ellipsis; }

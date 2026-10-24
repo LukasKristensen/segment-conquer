@@ -349,7 +349,7 @@ function setBusy(on) {
   busy = on;
   $('#sync-btn').disabled = on;
   $('#explore-btn').disabled = on;
-  $('#scan-btn').disabled = on;
+  $('#update-btn').disabled = on;
   if (!on) $('#progress').style.width = '0';
 }
 
@@ -363,35 +363,41 @@ function setProgress(done, total) {
   $('#progress').style.width = total ? `${Math.round((done / total) * 200)}px` : '0';
 }
 
+// Fetches any of your last N activities not stored yet; returns how many were new.
+async function checkActivities() {
+  setStatus('Checking for new activities…');
+  const { data: activities } = await api(`/api/activities?count=${settings.scanCount}`);
+  const scannable = activities.filter((a) => !a.manual && !/virtual/i.test(a.sport_type || ''));
+  // Each activity is stored by the server; already-stored ones cost nothing.
+  let done = 0;
+  let fresh = 0;
+  await pool(scannable, 4, async (a) => {
+    const { cached } = await api(`/api/activity/${a.id}`);
+    if (!cached) fresh++;
+    setProgress(++done, scannable.length);
+    setStatus(`Checking activities ${done}/${scannable.length}${fresh ? `, ${fresh} new` : ''}`);
+  });
+  return fresh;
+}
+
+// `fresh` skips the 6-hour cache, so segments starred a minute ago in Strava show up.
+async function checkStarred(fresh = false) {
+  try {
+    await api(`/api/starred${fresh ? '?refresh=1' : ''}`);
+  } catch (err) {
+    if (err instanceof StopSync) throw err;
+    console.warn('Starred segments failed', err);
+  }
+}
+
 async function sync() {
   if (busy) return;
   setBusy(true);
   try {
-    setStatus('Loading activity list…');
-    const { data: activities } = await api(`/api/activities?count=${settings.scanCount}`);
-    const scannable = activities.filter((a) => !a.manual && !/virtual/i.test(a.sport_type || ''));
-
-    // Each activity is stored by the server; already-stored ones cost nothing.
-    let done = 0;
-    let fresh = 0;
-    await pool(scannable, 4, async (a) => {
-      const { cached } = await api(`/api/activity/${a.id}`);
-      if (!cached) fresh++;
-      setProgress(++done, scannable.length);
-      setStatus(`Checking activities ${done}/${scannable.length}${fresh ? `, ${fresh} new` : ''}`);
-    });
-
-    try {
-      await api('/api/starred');
-    } catch (err) {
-      if (err instanceof StopSync) throw err;
-      console.warn('Starred segments failed', err);
-    }
-
+    await checkActivities();
+    await checkStarred();
     await loadLibrary();
     settings.hasSynced = true;
-    // Nothing discovered yet means "New to me" would be empty; show what was just synced instead.
-    if (settings.mode === 'discover' && !hasDiscovered()) setMode('mine');
     saveSettings();
     fitMapOnce();
     await loadDetails();
@@ -418,11 +424,7 @@ function handleLoadError(err, resume) {
 
 // Details cost one request each, so only fetch them for segments the current view can show:
 // "New to me" never shows segments you've ridden, and nothing outside the home radius is shown.
-const needsDetail = (s) => {
-  const km = homeKmOf(s);
-  if (settings.home && settings.radiusKm && km != null && km > settings.radiusKm) return false;
-  return settings.mode !== 'discover' || !store.efforts.has(s.id);
-};
+const needsDetail = (s) => insideRadiusFilter(s) && (settings.mode !== 'discover' || !store.efforts.has(s.id));
 
 async function loadForView() {
   if (busy) return;
@@ -549,12 +551,11 @@ async function exploreArea() {
     );
     setExploreBlocked(false);
     await loadLibrary();
-    setMode('discover');
-    saveSettings();
-    await loadDetails();
+    await loadDetails(notDoneNearby);
     setStatus(
       `Discovered ${found} new ${sport.toLowerCase()} segment${found === 1 ? '' : 's'} in ${searches} searches.` +
-        (unfinished ? ' Search budget used up; click Discover again to dig deeper.' : '')
+        (unfinished ? ' Search budget used up; click Discover again to dig deeper.' : '') +
+        hiddenHint('notDone')
     );
   } catch (err) {
     if (err.code === 'explore_unavailable') setExploreBlocked(true);
@@ -598,12 +599,11 @@ async function discoverRoutes() {
       return;
     }
     await loadLibrary();
-    setMode('discover');
-    saveSettings();
-    await loadDetails();
+    await loadDetails(notDoneNearby);
     setStatus(
       `Found ${found} new segment${found === 1 ? '' : 's'} on your ${routes} saved routes. ` +
-        '(Strava blocks map search for this app, so plan routes through new areas on strava.com/maps to discover more.)'
+        '(Strava blocks map search for this app, so plan routes through new areas on strava.com/maps to discover more.)' +
+        hiddenHint('notDone')
     );
   } catch (err) {
     handleLoadError(err, discoverRoutes);
@@ -611,6 +611,24 @@ async function discoverRoutes() {
     setBusy(false);
     render();
   }
+}
+
+// Discoveries are segments you haven't done; they get details whatever mode is showing, but
+// segments outside the home radius are still skipped.
+const insideRadiusFilter = (s) => {
+  const km = homeKmOf(s);
+  return !settings.home || !settings.radiusKm || km == null || km <= settings.radiusKm;
+};
+const notDoneNearby = (s) => !store.efforts.has(s.id) && insideRadiusFilter(s);
+
+// Discover and Update leave the mode alone; say so when their results are filtered out of the list.
+function hiddenHint(kind) {
+  if (settings.mode === 'all') return '';
+  if (kind === 'notDone' && settings.mode === 'discover') return '';
+  const label = { discover: 'New to me', mine: 'My segments' }[settings.mode];
+  return kind === 'notDone'
+    ? ` The list is set to "${label}"; pick "New to me" or "All segments" to see segments you haven't done.`
+    : ` The list is set to "${label}"; pick "All segments" to see everything.`;
 }
 
 const inRadius = (seg) => {
@@ -630,40 +648,53 @@ function tileTouchesRadius([s, w, n, e]) {
   return haversineKm(settings.home, [clamp(lat, s, n), clamp(lng, w, e)]) <= settings.radiusKm;
 }
 
-// Scan everything reachable inside the home radius: map search over the circle when Strava allows
-// it (retried daily), otherwise your saved routes; then details for every known segment in range.
-async function scanRadius() {
+// One button for everything that can turn up new segments near home: new activities, segments you
+// starred in Strava (checked fresh every time), map search over the circle when Strava allows it
+// (retried daily), and new or edited routes. Then details for every known segment in range.
+async function updateNearHome() {
   if (busy || !settings.home || !settings.radiusKm) return;
   setBusy(true);
+  const before = new Set(store.summaries.keys());
   try {
-    let source = '';
+    const newActivities = await checkActivities();
+    setStatus('Checking your starred segments…');
+    await checkStarred(true);
+
+    let mapSearch = '';
     if (!exploreBlocked()) {
       try {
         const sport = discoverSport();
         const { searches, unfinished } = await sweep(radiusBounds(), sport === 'Run' ? 'running' : 'riding', tileTouchesRadius);
         setExploreBlocked(false);
-        source = `Map search covered the radius in ${searches} searches${unfinished ? ' (budget used up; scan again to dig deeper)' : ''}.`;
+        mapSearch = ` Map search covered the radius in ${searches} searches${unfinished ? ' (budget used up; update again to dig deeper)' : ''}.`;
       } catch (err) {
         if (err.code !== 'explore_unavailable') throw err;
         setExploreBlocked(true);
       }
     }
-    if (!source) {
-      const { routes } = await readRoutes();
-      source = `Strava blocks map search for this app, so only segments you've done, starred or that lie on your ${routes} saved routes can be found. Plan routes through unexplored roads on strava.com/maps to find more.`;
-    }
+    await readRoutes();
 
     await loadLibrary();
-    setMode('all');
-    saveSettings();
     render();
     await loadDetails(inRadius);
 
     const inside = [...store.summaries.values()].filter((s) => inRadius(s) && !s.hazardous && !s.private);
-    const ridden = inside.filter((s) => store.efforts.has(s.id)).length;
-    setStatus(`${inside.length} segments within ${settings.radiusKm} km: ${ridden} you've done, ${inside.length - ridden} you haven't. ${source}`);
+    const done = inside.filter((s) => store.efforts.has(s.id)).length;
+    const fresh = inside.filter((s) => !before.has(s.id));
+    const by = (src) => fresh.filter((s) => store.sources.get(s.id)?.has(src)).length;
+    const parts = [
+      newActivities && `${newActivities} new activit${newActivities === 1 ? 'y' : 'ies'}`,
+      fresh.length && `${fresh.length} new segment${fresh.length === 1 ? '' : 's'} nearby (${by('starred')} starred, ${by('route')} on routes, ${by('ridden')} from activities)`,
+    ].filter(Boolean);
+    setStatus(
+      `${inside.length} segments within ${settings.radiusKm} km: ${done} done, ${inside.length - done} not yet. ` +
+        (parts.length ? `${parts.join(', ')}.` : 'Nothing new.') +
+        (mapSearch || ' To add more, star segments on Strava\'s map or plan routes through new roads, then update again.') +
+        hiddenHint('any')
+    );
   } catch (err) {
-    handleLoadError(err, scanRadius);
+    await loadLibrary().catch(() => {});
+    handleLoadError(err, updateNearHome);
   } finally {
     setBusy(false);
     render();
@@ -723,6 +754,7 @@ function visibleRows() {
     athletes: (r) => r.athletes,
     kom: (r) => r.kom,
     target: (r) => r.target,
+    speed: (r) => (r.target && r.seg.distance ? r.seg.distance / r.target : null), // m/s, so rides and runs sort together
     pr: (r) => r.pr ?? r.predicted,
     score: (r) => r.score,
   }[key];
@@ -804,6 +836,7 @@ function rowHtml(r) {
     <td class="num">${fmtInt(r.athletes)}</td>
     <td class="num">${fmtTime(r.kom)}</td>
     <td class="num">${r.det ? target : '…'}</td>
+    <td class="num">${r.target ? fmtPace(r.seg, r.target).replace(' /km', '/km') : r.targetSource === 'free' ? 'any' : '-'}</td>
     <td class="num">${youCell}</td>
     <td class="num">${gapCell}</td>
   </tr>`;
@@ -865,7 +898,38 @@ function select(id, pan = true) {
   selectedId = id;
   render();
   const layer = mapLayers.get(id);
-  if (pan && layer) map.fitBounds(layer.getBounds ? layer.getBounds() : L.latLngBounds([layer.getLatLng()]), { maxZoom: 15, padding: [40, 40] });
+  if (layer) showOnMap(layer, !pan);
+  // Picked on the map: bring its row into view in the list.
+  if (!pan) document.querySelector(`#seg-body tr[data-id="${id}"]`)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+// Zoom to a segment while keeping it clear of the detail panel, which sits over the map's
+// bottom-right corner (or its whole bottom on narrow screens).
+function showOnMap(layer, onlyIfHidden) {
+  const bounds = layer.getBounds ? layer.getBounds() : L.latLngBounds([layer.getLatLng()]);
+  const mapBox = map.getContainer().getBoundingClientRect();
+  const panel = $('#detail');
+  const panelBox = panel.classList.contains('hidden') ? null : panel.getBoundingClientRect();
+
+  if (onlyIfHidden) {
+    if (!panelBox) return;
+    const nw = map.latLngToContainerPoint(bounds.getNorthWest());
+    const se = map.latLngToContainerPoint(bounds.getSouthEast());
+    const left = panelBox.left - mapBox.left;
+    const top = panelBox.top - mapBox.top;
+    const covered = se.x > left && nw.x < left + panelBox.width && se.y > top && nw.y < top + panelBox.height;
+    if (!covered) return;
+  }
+
+  const pad = 40;
+  let bottomRight = [pad, pad];
+  if (panelBox) {
+    bottomRight =
+      mapBox.width - panelBox.width > 220
+        ? [mapBox.right - panelBox.left + pad, pad] // room to the left of the panel
+        : [pad, Math.min(mapBox.bottom - panelBox.top + pad, mapBox.height * 0.6)]; // room above it
+  }
+  map.fitBounds(bounds, { maxZoom: 15, paddingTopLeft: [pad, pad], paddingBottomRight: bottomRight });
 }
 
 // ---------- map ----------
@@ -900,8 +964,8 @@ function updateHome() {
   const home = settings.home;
   $('#home-btn').textContent = home ? '🏠 Move home' : '🏠 Set home';
   $('#radius').classList.toggle('hidden', !home);
-  $('#scan-btn').classList.toggle('hidden', !home || !settings.radiusKm);
-  $('#scan-btn').textContent = `📡 Scan ${settings.radiusKm} km`;
+  $('#update-btn').classList.toggle('hidden', !home || !settings.radiusKm);
+  $('#update-btn').textContent = '🔄 Update near home';
   $('#radius').value = String(settings.radiusKm);
   if (!homeLayer) return;
   homeLayer.clearLayers();
@@ -982,9 +1046,19 @@ function renderMap(rows) {
     const selected = r.id === selectedId;
     let layer;
     if (r.det?.polyline) {
-      layer = L.polyline(decodePolyline(r.det.polyline), { color, weight: selected ? 7 : 4, opacity: selected ? 1 : 0.85 });
+      const pts = decodePolyline(r.det.polyline);
+      layer = selected
+        ? L.featureGroup([
+            L.polyline(pts, { color: '#fff', weight: 12, opacity: 0.95 }), // halo
+            L.polyline(pts, { color, weight: 6, opacity: 1 }),
+            L.circleMarker(pts[0], { radius: 6, color: '#fff', weight: 2, fillColor: '#22c55e', fillOpacity: 1 }).bindTooltip('Start'),
+            L.circleMarker(pts[pts.length - 1], { radius: 6, color: '#fff', weight: 2, fillColor: '#111', fillOpacity: 1 }).bindTooltip('Finish'),
+          ])
+        : L.polyline(pts, { color, weight: 4, opacity: 0.85 });
     } else if (r.seg.start_latlng?.length === 2) {
-      layer = L.circleMarker(r.seg.start_latlng, { radius: 5, color, fillOpacity: 0.8 });
+      layer = selected
+        ? L.circleMarker(r.seg.start_latlng, { radius: 10, color: '#fff', weight: 3, fillColor: color, fillOpacity: 1 })
+        : L.circleMarker(r.seg.start_latlng, { radius: 5, color, fillOpacity: 0.8 });
     } else continue;
     layer.bindTooltip(`${esc(r.seg.name)}<br>${STATUS[r.status].label}${r.gapPct != null ? ` · ${fmtPct(r.gapPct)}` : ''}`, { sticky: true });
     layer.on('click', () => select(r.id, false));
@@ -1029,7 +1103,7 @@ function bindEvents() {
   });
 
   $('#home-btn').addEventListener('click', pickHome);
-  $('#scan-btn').addEventListener('click', scanRadius);
+  $('#update-btn').addEventListener('click', updateNearHome);
   $('#radius').addEventListener('change', (e) => {
     settings.radiusKm = Number(e.target.value);
     saveSettings();

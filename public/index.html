@@ -33,8 +33,9 @@
       <div class="brand">🏁 Segment Conquer</div>
       <div class="sync">
         <label>Scan last
-          <select id="scan-count">
+          <select id="scan-count" title="Each activity not stored yet costs one Strava request; big scans continue automatically across rate-limit windows">
             <option>15</option><option selected>30</option><option>60</option><option>100</option><option>200</option>
+            <option>500</option><option>1000</option><option value="100000">all</option>
           </select>
           activities
         </label>
@@ -72,7 +73,7 @@
               <option value="30">Within 30 km</option>
               <option value="50">Within 50 km</option>
             </select>
-            <button id="scan-btn" class="btn hidden" title="Find and load every segment the app can reach inside the home radius">📡 Scan radius</button>
+            <button id="update-btn" class="btn hidden" title="Check new activities, segments you starred on Strava and new or edited routes, then load every segment inside the home radius">🔄 Update near home</button>
             <select id="sport-filter">
               <option value="all">All sports</option>
               <option value="Ride">Rides</option>
@@ -101,6 +102,7 @@
                 <th data-sort="athletes" class="num">Athletes</th>
                 <th data-sort="kom" class="num">KOM</th>
                 <th data-sort="target" class="num">~10th</th>
+                <th data-sort="speed" class="num" title="Average speed (rides, km/h) or pace (runs, min/km) needed for 10th place">Target</th>
                 <th data-sort="pr" class="num" title="Your PR, or ~predicted good-day time on segments you haven't done">You</th>
                 <th data-sort="score" class="num">Gap</th>
               </tr>

@@ -46,6 +46,9 @@ const TTL = {
 // Stop this many requests short of Strava's limits so a sync never ends in a hard 429 lockout.
 const RATE_RESERVE = 2;
 
+const PER_PAGE = 200; // Strava's maximum page size for the activity list
+const MAX_SCAN = 100_000; // "All activities"
+
 const isConfigured = () => Boolean(CLIENT_ID && CLIENT_SECRET);
 const pendingStates = new Set();
 let rate = null; // last seen rate-limit headers, plus when each window resets
@@ -250,7 +253,7 @@ async function api(route, url, req) {
   if (route === '/api/activities') {
     // Incremental: ask only for activities newer than the newest known one, and for older ones only
     // while fewer than `count` are known. A routine sync is a single request.
-    const count = Math.min(Math.max(Number(url.searchParams.get('count')) || 30, 1), 400);
+    const count = Math.min(Math.max(Number(url.searchParams.get('count')) || 30, 1), MAX_SCAN);
     const entry = (a) => ({ id: a.id, name: a.name, sport_type: a.sport_type || a.type, start_date: a.start_date, distance: a.distance, manual: a.manual });
     const epoch = (iso) => Math.floor(Date.parse(iso) / 1000);
     let fresh = 0;
@@ -260,20 +263,20 @@ async function api(route, url, req) {
       const { newest } = db.indexBounds();
       if (force || Date.now() - Number(db.getMeta('activities_checked_at') || 0) > TTL.activityList) {
         for (let page = 1; ; page++) {
-          const batch = await stravaGet('/athlete/activities', { per_page: 100, page, ...(newest && { after: epoch(newest) }) });
+          const batch = await stravaGet('/athlete/activities', { per_page: PER_PAGE, page, ...(newest && { after: epoch(newest) }) });
           fresh++;
           db.putIndex(batch.map(entry));
-          if (batch.length < 100 || !newest) break; // without `after`, older pages are the backfill's job
+          if (batch.length < PER_PAGE || !newest) break; // without `after`, older pages are the backfill's job
         }
         db.putMeta('activities_checked_at', Date.now());
       }
       while (db.getMeta('activities_complete') !== '1') {
         const { n, oldest } = db.indexBounds();
         if (n >= count || !oldest) break;
-        const batch = await stravaGet('/athlete/activities', { per_page: 100, before: epoch(oldest) });
+        const batch = await stravaGet('/athlete/activities', { per_page: PER_PAGE, before: epoch(oldest) });
         fresh++;
         db.putIndex(batch.map(entry));
-        if (batch.length < 100) db.putMeta('activities_complete', '1'); // reached your first activity
+        if (batch.length < PER_PAGE) db.putMeta('activities_complete', '1'); // reached your first activity
       }
     } catch (err) {
       // Out of budget: carry on with the activities already known rather than blocking the sync.

@@ -28,16 +28,22 @@ The filter covers every segment the app knows about: ridden, starred, discovered
 If Strava blocks map search for your app, unknown segments near home won't appear until a route or
 activity passes them.
 
-**📡 Scan** finds and loads everything it can inside the radius:
+**🔄 Update near home** runs everything that can turn up new segments, then shows everything inside
+the radius:
 
-1. When map search is available, it sweeps the whole circle, not just the map view, and skips map
-   tiles outside it. If Strava refused map search before, it retries at most once a day.
-2. Otherwise it reads your saved routes, re-reading only ones you've edited.
-3. It then loads details for every known segment inside the radius, whichever mode is selected, and
-   switches to **All segments**.
+1. Checks for new activities, like Sync.
+2. Checks your starred segments every time, skipping the usual 6-hour cache. Browse Strava's own
+   segment map, star what looks interesting, then click Update.
+3. When map search is available, sweeps the whole circle and skips map tiles outside it. If Strava
+   refused map search before, it retries at most once a day.
+4. Reads saved routes, re-reading only new or edited ones.
+5. Loads details for every known segment inside the radius, whichever mode is selected.
 
-The status line then reports how many segments are in range, how many you've done, and where they
-came from.
+Discover and Update never change the list's mode or filters. If their results are hidden by the
+current mode, the status line says so.
+
+The status line then reports how many segments are in range, how many you've done, and what's new
+(starred, on routes or from activities).
 
 ### Discovering new segments
 
